@@ -364,6 +364,8 @@ def extract(rgp, outdir):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__); sys.exit(0)
     if len(sys.argv) != 4 or sys.argv[1] != "extract":
         sys.exit(__doc__)
     info, objects = extract(sys.argv[2], sys.argv[3])

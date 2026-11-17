@@ -10,7 +10,9 @@
 # The vendored decode.py and Python decoder package are in third_party/ (MIT, see LICENSE, PROVENANCE).
 set -euo pipefail
 [ $# -eq 1 ] || { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 2; }
-D=$(realpath "$1"); H=$(dirname "$(realpath "$0")")
+case $1 in -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0;; esac
+[ -d "$1" ] || { echo "decode.sh: $1 is not a capture directory" >&2; exit 2; }
+D=$(realpath -e -- "$1") || exit 2; [ -n "$D" ] && [ "$D" != / ] || exit 2; H=$(dirname "$(realpath "$0")")
 rm -rf "$D/decoded"
 docker run --rm --memory "${DECODE_MEM:-24g}" --memory-swap "${DECODE_MEM:-24g}" -u "$(id -u):$(id -g)" -v "$D:$D" -v "$H/third_party:/tp:ro" -w "$D" \
   "${DECODE_IMAGE:-rocm/dev-ubuntu-24.04:10.1.0-full}" \

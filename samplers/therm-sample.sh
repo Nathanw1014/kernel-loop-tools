@@ -5,6 +5,8 @@
 # name (k10temp; hwmon numbers move across reboots). tctl reads 0 when there is no k10temp. The header records the
 # highest pp_dpm_sclk level (sclk_max_mhz) so therm-summary.py can derive its throttle floor. Reads sysfs only.
 . "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+case ${1:-} in -h|--help) usage; exit 0;; -*) usage >&2; exit 2;; esac
 OUT=${1:?outfile}; IV=${2:-10}
 hw(){ for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name 2>/dev/null)" = "$1" ] && { echo $h; return; }; done; }
 D=$(klt_gpu_card) || { echo "therm-sample: no amdgpu card (set KLT_GPU_CARD)" >&2; exit 1; }

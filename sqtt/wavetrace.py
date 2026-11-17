@@ -347,6 +347,8 @@ def isa(d, codeobj=None):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
+    if a and a[0] in ("-h", "--help"):
+        print(__doc__); sys.exit(0)
     if len(a) >= 2 and a[0] == "check":
         sys.exit(0 if check(a[1]) else 1)
     elif len(a) >= 2 and a[0] == "summary":

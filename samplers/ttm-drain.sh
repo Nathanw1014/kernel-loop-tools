@@ -7,6 +7,9 @@
 # run the shrinkers (drop_caches=2: slab only, the page cache and any mmap'd model stay), re-check, append a line to
 # $KLT_HOME/ttm-drain.log. Prints one token for the caller's settle line; always exits 0.
 . "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+case ${1:-} in -h|--help) usage; exit 0;; esac
+case ${1:-0} in *[!0-9]*) echo "ttm-drain.sh: need_gb must be an integer (got '$1')" >&2; exit 2;; esac
 NEED=${1:-0}; MINP=${TTM_DRAIN_MIN_POOL_GIB:-4}; LOG=$KLT_HOME/ttm-drain.log
 ma(){ awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo; }
 pool(){ sudo -n cat /sys/kernel/debug/ttm/page_pool 2>/dev/null | awk '/^total/{print int($3/262144)}'; }   # 4 KiB pages -> GiB

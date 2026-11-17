@@ -8,3 +8,4 @@ bench/mmid_det
 bench/kv-membench/bench
 bench/kv-membench/bench_spv.h
 bench/kv-membench/*.spv
+.claude/

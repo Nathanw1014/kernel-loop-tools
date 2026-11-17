@@ -8,6 +8,8 @@ def stat():
         if l.startswith('cpu') and l[3].isdigit():
             f=l.split(); v=list(map(int,f[1:])); r[f[0]]=(sum(v)-v[3]-v[4],sum(v))
     return r
+if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+    print('cpusamp.py <out.tsv>: per-CPU freq and busy every 100 ms until killed'); sys.exit(0 if len(sys.argv) > 1 else 2)
 o=open(sys.argv[1],'w'); prev=stat()
 while True:
     time.sleep(0.1); t=time.time(); s=stat()

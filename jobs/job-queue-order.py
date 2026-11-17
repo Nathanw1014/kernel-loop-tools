@@ -22,6 +22,10 @@ def key(k, n):
     return "0%0*d-%s" % (W, k, base(n))
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__); sys.exit(0)
+    if len(sys.argv) < 3:
+        print(__doc__, file=sys.stderr); sys.exit(2)
     mv, mode = sys.argv[1], sys.argv[2]
     tgt = sys.argv[3] if len(sys.argv) > 3 else ""
     names = sorted(l.strip() for l in sys.stdin if l.strip())

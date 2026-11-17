@@ -32,6 +32,8 @@ def load(p):
                     k, v = w.split('=', 1)
                     try: hdr[k] = float(v)
                     except ValueError: pass
+            if 'GB/s/raw' in l and 'cal' in hdr:   # older sampler format: cal = GB/s per raw unit, not a factor
+                hdr['cal'] /= 0.001
         if l.startswith('#'): continue
         f = l.rstrip('\n').split('\t')
         if len(f) < 14: continue

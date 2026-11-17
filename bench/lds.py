@@ -10,12 +10,12 @@ float mul_mm path); re-check it against that function when the shader changes, a
                 index 0 BLOCK_SIZE, 1 BM, 2 BN, 3 BK, 4 WM, 5 WN, 6 WMITER, 7 TM, 8 TN, 9 TK, 10 WARP (subgroup size)
               only 0, 1, 2, 3, 7, 8 and 10 enter the formula; e.g. 128,128,128,16,64,64,2,4,4,1,32
   --fp32      device without fp16 shared buffers (element size 4 instead of 2)
-  --coopmat   cooperative-matrix device: row padding 8 instead of 1, plus the TM x TN / warps f32 staging area
+  --coopmat   cooperative-matrix device: row padding 8 instead of 1, plus the TM x TN x warps f32 staging area
   --bank-offset N   override the row padding (elements)
   --mmid      MUL_MAT_ID variant (adds BN x 2 u16 row ids)
   --limit B   maxComputeSharedMemorySize of your device (vulkaninfo); default 65536
 
-Formula: (BM + BN) x (BK + pad) x elem + [mmid] BN x 4 + [coopmat] TM x TN / (BLOCK_SIZE / WARP) x 4 + LUT(TYPE)."""
+Formula: (BM + BN) x (BK + pad) x elem + [mmid] BN x 4 + [coopmat] TM x TN x (BLOCK_SIZE / WARP) x 4 + LUT(TYPE)."""
 import sys
 
 LUT = {'IQ1_S': 2 * 2048, 'IQ1_M': 2 * 2048, 'IQ2_XXS': 8 * 256, 'IQ2_XS': 8 * 512, 'IQ2_S': 8 * 1024,
@@ -43,7 +43,7 @@ elem = 4 if fp32 else 2
 warps = blk // warp
 load_bufs = (bm + bn) * (bk + pad) * elem
 row_ids = bn * 2 * 2 if mmid else 0
-stage = tm * tn // warps * 4 if coopmat else 0
+stage = tm * tn * warps * 4 if coopmat else 0   # upstream: warptile[7] * warptile[8] * warps * sizeof(float)
 lut = LUT.get(t, 0)
 tot = load_bufs + row_ids + stage + lut
 print(f"LDS {t} {spec_s}: load_bufs {load_bufs} + mmid_row_ids {row_ids} + coopmat_stage {stage} + lut {lut} = {tot} B "

@@ -7,6 +7,9 @@
 # Defaults (args > env > built-in): COOL_TCTL=60, COOL_EDGE=50, COOL_S=600. Pick limits a few degrees above what the
 # machine reads after ~10 idle minutes at your ambient; too low and every cell waits the full timeout.
 # COOL_TTM_GB=<GB> (opt-in, default unset = skip): also run ttm-drain.sh <GB> and append its token (needs sudo -n).
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+case ${1:-} in -h|--help) usage; exit 0;; esac
+for a in "$@"; do case $a in *[!0-9]*|"") echo "cooldown.sh: numeric args only (got '$a')" >&2; exit 2;; esac; done
 T=${1:-${COOL_TCTL:-60}}; E=${2:-${COOL_EDGE:-50}}; TO=${3:-${COOL_S:-600}}
 S=$(dirname "$(readlink -f "$0")"); . "$S/../lib/klt-env.sh"
 hw(){ for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name 2>/dev/null)" = "$1" ] && { echo $h; return; }; done; }

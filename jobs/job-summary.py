@@ -6,7 +6,10 @@ Bench cells named "<arm>.<rep>" are grouped by arm: per test the mean of the rep
 summary is reconstructable from the raw records."""
 import json, os, re, sys
 
+if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    print(__doc__); sys.exit(0 if len(sys.argv) > 1 else 2)
 out = sys.argv[1]
+if not os.path.isdir(out): sys.exit(f"job-summary.py: no record dir {out}")
 res = os.path.join(out, "RESULTS.txt")
 order = []
 for line in open(res, errors="replace") if os.path.exists(res) else []:

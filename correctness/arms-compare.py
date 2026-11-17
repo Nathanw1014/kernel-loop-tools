@@ -2,6 +2,9 @@
 # arms-compare.py <arms-a.json> <arms-b.json> [label]: compare the greedy token streams of two rollback_gate.py runs arm by
 # arm (A1/A2/B/L1/L2/C and the three diag runs); prints PASS when every arm is token-identical, else the first difference.
 import json, sys
+if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
+    print("arms-compare.py <arms-a.json> <arms-b.json> [label]: compare two rollback_gate.py --out files arm by arm")
+    sys.exit(0 if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help") else 2)
 a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2])); lab = sys.argv[3] if len(sys.argv) > 3 else "streams"
 ok = True; out = []
 def cmp(name, x, y):

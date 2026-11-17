@@ -19,7 +19,9 @@
 set -u
 SET=${TRACE_SET:-wake}; OUTF=${TRACE_OUT:-$PWD/trace.gz}; COMM=${TRACE_COMM:-}; BUF=${TRACE_BUF_KB:-24576}
 while [ $# -gt 0 ]; do case $1 in
-  --set) SET=$2; shift 2;; --out) OUTF=$2; shift 2;; --comm) COMM=$2; shift 2;; --buf) BUF=$2; shift 2;; --) shift; break;; *) break;; esac; done
+  -h|--help) sed -n '2,18p' "$0"; exit 0;;
+  --set) SET=$2; shift 2;; --out) OUTF=$2; shift 2;; --comm) COMM=$2; shift 2;; --buf) BUF=$2; shift 2;; --) shift; break;;
+  -*) echo "trace-run: unknown option $1 (put the command after --)" >&2; exit 2;; *) break;; esac; done
 [ $# -gt 0 ] || { sed -n '2,18p' "$0" >&2; exit 2; }
 D=$(dirname "$(readlink -f "$0")"); TR=/sys/kernel/tracing; I=$TR/instances/klt-trace-$$
 case $OUTF in *.gz) BASE=${OUTF%.gz};; *) BASE=$OUTF; OUTF=$OUTF.gz;; esac; META=$BASE.meta.txt

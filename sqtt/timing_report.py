@@ -13,6 +13,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import wavetrace
 
+if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
+    print('usage: timing_report.py <decoded capture dir> <kernel regex> [label]'); sys.exit(0)
 if len(sys.argv) < 3:
     sys.exit('usage: timing_report.py <decoded capture dir> <kernel regex> [label]')
 d = Path(sys.argv[1]); pat = re.compile(sys.argv[2]); label = sys.argv[3] if len(sys.argv) > 3 else d.name
