@@ -16,6 +16,8 @@ LIB=$BLD/bin; [ -e "$LIB/libllama.so" ] || LIB=$(dirname "$(find "$BLD" -name li
 COMMON=$(find "$LIB" "$BLD" -maxdepth 2 \( -name 'libllama-common.so' -o -name 'libcommon.a' -o -name 'libllama-common.a' \) -print -quit)
 mkdir -p "$OUT"
 INC=(-I"$SRC/include" -I"$SRC/ggml/include" -I"$SRC/common" -I"$SRC/vendor")
+# ggml replaced ggml_flash_attn_ext_set_prec with the generic ggml_prec_set_acc: pick whichever this tree has
+grep -q "ggml_prec_set_acc" "$SRC/ggml/include/ggml.h" && INC+=(-DKLT_GGML_PREC_SET_ACC=1)
 LNK=(-L"$LIB" -Wl,-rpath,"\$ORIGIN" -Wl,-rpath,"$LIB" -lllama -lggml -lggml-base)
 set -x
 "$CXX" -O2 -std=c++17 "${INC[@]}" -o "$OUT/graphdump" "$ROOT/graph/graphdump.cpp" "${LNK[@]}"

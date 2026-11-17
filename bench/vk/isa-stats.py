@@ -7,7 +7,8 @@ usage: RADV_DEBUG=asm,nocache GGML_VK_PIPELINE_STATS=<name-substring> <llama-ben
 GGML_VK_PIPELINE_STATS (upstream ggml-vulkan) prints "pipeline stats for <name>" plus VGPRs / LDS / waves per SIMD / code
 size after each pipeline compile whose name contains the substring ("_" matches nearly all); RADV_DEBUG=asm prints the ISA
 just before. Each ISA dump is attributed to the next stats line; the two must alternate 1:1, and the first output line
-reports how many did not ("attribution mismatches"; non-zero = pipelines without stats, e.g. a cache hit: keep nocache).
+reports "N without stats" (dumps whose pipeline the stats filter skipped: expected with a filter; or a cache hit: keep
+nocache) and "attribution errors" (a stats line with no dump of its own: two compiles interleaved; must be 0).
 For each pipeline that has v_wmma: whole-shader counts, counts of the loop holding the most v_wmma (header .. last back-edge
 block), VALU = v_* other than v_wmma, and a barrier check: the instruction directly in front of each s_barrier and any
 s_waitcnt vmcnt within the 3 before it (static; a barrier at a block start shows its own block only).
@@ -17,10 +18,10 @@ import re, sys, collections
 if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
     print(__doc__); sys.exit(0 if len(sys.argv) > 1 else 2)
 log = sys.argv[1]; flt = re.compile(sys.argv[2]) if len(sys.argv) > 2 else None
-segs = []; cur = None; stats = None; mism = 0
+segs = []; cur = None; stats = None; mism = 0; unnamed = 0
 for l in open(log, errors='replace'):
     if l.startswith('Compute Shader'):
-        if cur is not None and cur.get('name') is None: mism += 1
+        if cur is not None and cur.get('name') is None: unnamed += 1
         cur = {'lines': [], 'name': None, 'st': {}}; segs.append(cur); stats = None; continue
     m = re.match(r'ggml_vulkan: pipeline stats for (\S+):', l)
     if m:
@@ -29,7 +30,9 @@ for l in open(log, errors='replace'):
     m = re.match(r'ggml_vulkan:   ([A-Za-z ]+): (\d+)', l)
     if m and stats is not None: stats[m.group(1)] = int(m.group(2)); continue
     if cur is not None and cur['name'] is None: cur['lines'].append(l)
-print(f"# {log}: {len(segs)} dumps, {sum(1 for s in segs if s['name'])} named, attribution mismatches {mism}")
+if cur is not None and cur.get('name') is None: unnamed += 1
+print(f"# {log}: {len(segs)} dumps, {sum(1 for s in segs if s['name'])} named, {unnamed} without stats "
+      f"(filtered out by GGML_VK_PIPELINE_STATS, or a cache hit), attribution errors {mism}")
 opre = re.compile(r'=\s+([a-z][a-z0-9_]+)\b')
 opre2 = re.compile(r'\s+([sv]_[a-z0-9_]+|ds_[a-z0-9_]+|buffer_[a-z0-9_]+|global_[a-z0-9_]+)\b')
 def op(l):
@@ -66,7 +69,7 @@ for s in segs:
     for h in order:
         if 'loop-header' not in kinds[h]: continue
         m = re.search(r'logical preds: ([^/]*)/', kinds[h]); preds = [int(x) for x in re.findall(r'BB(\d+)', m.group(1))] if m else []
-        back = [p for p in preds if p > h]
+        back = [p for p in preds if p >= h]   # >=: a single-block loop is its own back edge
         if not back: continue
         body = [x for x in order if h <= x <= max(back)]
         c = collections.Counter()

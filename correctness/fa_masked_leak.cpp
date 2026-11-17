@@ -48,7 +48,11 @@ static std::vector<float> run(ggml_backend_t be, const Case & c, const std::vect
     ggml_tensor * tv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.hsk, c.nkv, c.nhkv, 1);
     ggml_tensor * tm = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.nkv, c.nq, 1, 1);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, tq, tk, tv, tm, 1.0f / sqrtf((float) c.hsk), 0.0f, 0.0f);
+#ifdef KLT_GGML_PREC_SET_ACC   // newer ggml (lib/build-ggml-tools.sh defines it when ggml.h has the generic API)
+    if (!getenv("FA_PREC_DEFAULT")) ggml_prec_set_acc(out, GGML_PREC_F32);
+#else
     if (!getenv("FA_PREC_DEFAULT")) ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+#endif
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);

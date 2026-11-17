@@ -75,7 +75,7 @@ def main():
     for h in [b for b in order if 'loop-header' in kinds[b]]:
         m = re.search(r'logical preds: ([^/]*)/', kinds[h])
         preds = [int(x) for x in re.findall(r'BB(\d+)', m.group(1))] if m else []
-        back = [p for p in preds if p > h]
+        back = [p for p in preds if p >= h]   # >=: a single-block loop is its own back edge
         if not back:
             continue
         body = [b for b in order if h <= b <= max(back)]

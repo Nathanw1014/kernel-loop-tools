@@ -5,7 +5,7 @@ usage: evcb-diff.py <A.log> <B.log> [--limit N] [--window W]
        evcb-diff.py --selftest                     classifier controls, no input files
 
 Make the dumps with the same model, prompt and flags on the two builds (or knob settings) under test:
-    llama-eval-callback -m M.gguf -p "<prompt>" -n 1 --no-warmup [-ngl 99 ...] > A.log 2>&1
+    llama-eval-callback -m M.gguf -p "<prompt>" -n 1 [-ngl 99 ...] > A.log 2>&1   (older builds also want --no-warmup)
 Each node prints "common_debug_cb_eval: <name> = (<type>) <OP>(...) = {shape}" and, a few lines later, "sum = <value>".
 Nodes are aligned by NAME, not by position: node_<N> and bare "(view)" / "(reshaped)" names shift between builds, so only
 identifier-like names count and node_* is skipped; same-named nodes can be reordered by the scheduler, so each A node is
