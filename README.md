@@ -86,6 +86,10 @@ jobs/job-wait --marker my-label-DONE --file "$KLT_RESULTS/my/RESULTS.txt"
 - Never restart the queue service while a job runs (systemd kills its cgroup, job included):
   `job-queue hold`, `job-wait --lock-free`, restart, `job-queue release`.
 
+## Licence
+
+MIT, see [LICENSE](LICENSE). Third-party code keeps its own licence (below).
+
 ## Third-party code
 
 `sqtt/third_party/` vendors an RGP / SQTT trace decoder under the MIT licence; see its
