@@ -10,7 +10,7 @@
 //
 // usage: topk_repeat <backend-name-substring> [ncols k nrows runs]     defaults 8192 2051 64 20
 //   k past a backend's small-k path exercises its large-k (e.g. radix-select) path; try several k.
-// Exit: 0 repeatable and control detected, 1 NOT REPEATABLE, 3 control not detected, 2 setup failure / unsupported op.
+// Exit: 0 repeatable (selected set; order too with TOPK_STRICT_ORDER=1) and control detected, 1 NOT REPEATABLE, 3 control not detected, 2 setup failure / unsupported op.
 // build: lib/build-ggml-tools.sh <llama.cpp source> <build dir>
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -111,10 +111,15 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(out, rc.data(), 0, (size_t) k * sizeof(int32_t));
     const bool ctl = set_differs(res[0].data(), rc.data());
     printf("control (row 0 input changed): selected set %s\n", ctl ? "differs (ok)" : "IDENTICAL (control broken)");
-    printf("SUMMARY ncols %d k %d nrows %d runs %d: runs differing in order %d/%d, in set %d/%d -> %s\n",
-           ncols, k, nrows, runs, runs_order, runs - 1, runs_set, runs - 1, (runs_order || runs_set) ? "NOT REPEATABLE" : "repeatable");
+    // ggml_top_k promises no order ("the resulting top k indices are in no particular order"): the verdict is on the SET;
+    // an order change is reported but fails only with TOPK_STRICT_ORDER=1 (for a consumer that relies on a sorted result).
+    const bool strict = getenv("TOPK_STRICT_ORDER") != nullptr;
+    const bool fail = runs_set || (strict && runs_order);
+    printf("SUMMARY ncols %d k %d nrows %d runs %d: runs differing in order %d/%d, in set %d/%d -> %s%s\n",
+           ncols, k, nrows, runs, runs_order, runs - 1, runs_set, runs - 1, fail ? "NOT REPEATABLE" : "repeatable",
+           (!fail && runs_order) ? " (set; order varies, which ggml_top_k allows)" : "");
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     ggml_backend_free(be);
-    return (runs_order || runs_set) ? 1 : ctl ? 0 : 3;
+    return fail ? 1 : ctl ? 0 : 3;
 }

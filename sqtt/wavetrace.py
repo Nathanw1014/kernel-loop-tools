@@ -114,6 +114,11 @@ def check(d):
         idle = len(markers) - labelled  # markers whose dispatch launched no traced waves (e.g. empty grids)
         print(f"markers={len(markers)} dispatches={len(groups)} matched={labelled} unmatched markers={idle} "
               f"{'OK' if labelled == len(groups) else 'MISMATCH'}")
+        meta = [m for m in markers if (m.get("command") or "").startswith("vkCmd") and not (m.get("command") or "").startswith("vkCmdDispatch")]
+        if meta and labelled < len(groups):
+            print(f"note: {len(meta)} marker(s) are driver transfer commands ({', '.join(sorted({m['command'] for m in meta}))}): RADV runs "
+                  "them with its own internal shader, which carries no ggml label. A model load issues one such submit per "
+                  "tensor upload; capture the compute submits (the largest captures, e.g. WT_KEEP_LAST at the end of a run).")
         ok &= labelled == len(groups)
     san = info.get("sanitize", {})
     if san.get("blanked_exec_tokens"):
