@@ -23,8 +23,8 @@
 # Refuses to start while $KLT_STOP exists (written by a tool that saw a device error).
 set -uo pipefail
 usage() { sed -n '2,23p' "$0"; exit 2; }
+case ${1:-} in -h|--help) sed -n '2,23p' "$0"; exit 0;; esac
 [ $# -ge 3 ] || usage
-case ${1:-} in -h|--help) usage;; esac
 LABEL=$1; BACKEND=$2; BIN=$3; shift 3
 [ "${1:-}" = "--" ] && shift
 ARGS=("$@")

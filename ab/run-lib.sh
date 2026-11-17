@@ -42,6 +42,7 @@ rl_icd() {   # rl_icd <backend>: pin the ICD for vulkan runs; no silent fallback
   if [ "$1" = vulkan ] && [ -n "$KLT_VK_ICD" ]; then
     [ -f "$KLT_VK_ICD" ] || { echo "[$RL_TAG] KLT_VK_ICD=$KLT_VK_ICD missing; refusing to run (unset it for the system driver)" >&2; exit 78; }
     export VK_ICD_FILENAMES=$KLT_VK_ICD VK_DRIVER_FILES=$KLT_VK_ICD
+    [ -n "${KLT_VK_LIBPATH:-}" ] && export LD_LIBRARY_PATH=$KLT_VK_LIBPATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
   fi
 }
 
