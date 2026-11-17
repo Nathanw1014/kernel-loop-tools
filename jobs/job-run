@@ -421,7 +421,8 @@ for l in sys.stdin:
   except Exception: continue
   t=("pp%d"%j["n_prompt"]) if j.get("n_prompt") else ("tg%d"%j.get("n_gen",0))
   print("%s@d%d:%.2f+-%.2f"%(t,j.get("n_depth",0),j["avg_ts"],j["stddev_ts"]),end=" ")' 2>/dev/null);;
-    tbo) s=$(sed 's/\x1b\[[0-9;]*m//g' $d/stdout.log | awk '/tests passed/{p=p $1 " "} /FAIL/{n++; if(n<=3){sub(/^ +/,""); f=f substr($0,1,80) "; "}} END{printf "passed %s fails=%d %s", p, n, f}');;
+    tbo) if grep -aq 'no test case matches the filters' $d/stdout.log $d/stderr.log 2>/dev/null; then s="NO TEST RAN (no case matches the filter)"; else
+         s=$(sed 's/\x1b\[[0-9;]*m//g' $d/stdout.log | awk '/tests passed/{p=p $1 " "} /FAIL/{n++; if(n<=3){sub(/^ +/,""); f=f substr($0,1,80) "; "}} END{printf "passed %s fails=%d %s", p, n, f}'); fi;;
     suite) s=$(sed 's/\x1b\[[0-9;]*m//g' $d/stdout.log | awk '/tests passed/{p=p $1 " "; if(match($0,/\(cached [^ )]*/)) c=substr($0,RSTART+1,RLENGTH-1)} /FAIL/{n++; if(n<=3){sub(/^ +/,""); f=f substr($0,1,80) "; "}}
       /^suite: shards=/{split($2,a,"="); split($3,w,"="); x="suite " a[2] " shards wall " w[2] " " $4 " " $8} /^suite: mon /{m=$3 " " $4 " " $6} END{printf "passed %s fails=%d %s%s%s", p, n, f, (c? "(" c ") ": ""), x (m? " " m: "")}');;
     ppl) s=$(cat $d/stdout.log $d/stderr.log | grep -aE 'Final estimate|Mean +KLD|Same top p|RMS Δp|Mean PPL\(Q\) ' | sed -E 's/ +/ /g' | tr '\n' ';' | cut -c1-260);;

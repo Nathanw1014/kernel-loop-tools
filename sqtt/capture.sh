@@ -14,8 +14,9 @@
 #   off                  untraced baseline under the same wrapper (same env, same lock).
 #
 # Env:
-#   WT_ICD=path.json   Vulkan ICD json of the Mesa to trace with (required for timing)
-#   WT_LDP=dir[:dir]   LD_LIBRARY_PATH for that Mesa (required for timing)
+#   WT_ICD=path.json   Vulkan ICD json of the Mesa to trace with (required for timing; default $KLT_VK_ICD, else the
+#                      caller's VK_ICD_FILENAMES: the environment is reset for the command, so nothing else carries over)
+#   WT_LDP=dir[:dir]   LD_LIBRARY_PATH for that Mesa (required for timing; default $KLT_VK_LIBPATH + the caller's LD_LIBRARY_PATH)
 #   WT_BUF=bytes       thread-trace buffer per shader engine (default 256 MiB)
 #   WT_SE_MASK=0x..    limit per-instruction records to these shader engines (timing mode)
 #   WT_KEEP=lo:hi      keep only submits lo..hi (others deleted as written; bounds disk use)
@@ -55,7 +56,10 @@ case $MODE in
   off) TRACE="" ;;
   *) echo "WT_MODE must be occupancy, timing or off" >&2; exit 2 ;;
 esac
-ICD=${WT_ICD:-}; LDP=${WT_LDP:-}
+# The command runs under setpriv --reset-env, so the caller's driver choice must be passed explicitly: default to the
+# pinned ICD ($KLT_VK_ICD, else the caller's VK_ICD_FILENAMES) and the caller's library path, never silently the system Mesa.
+ICD=${WT_ICD:-${KLT_VK_ICD:-${VK_ICD_FILENAMES:-}}}
+LDP=${WT_LDP:-${KLT_VK_LIBPATH:+$KLT_VK_LIBPATH:}${LD_LIBRARY_PATH:-}}; LDP=${LDP%:}
 [ -n "$ICD" ] && [ ! -r "$ICD" ] && { echo "WT_ICD not readable: $ICD" >&2; exit 2; }
 [ -e "$KLT_STOP" ] && { echo "$KLT_STOP exists (device error recorded); refusing: $(head -1 "$KLT_STOP")" >&2; exit 70; }
 if [ -n "${WT_MEMAVAIL_GB:-}" ]; then

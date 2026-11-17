@@ -25,6 +25,8 @@ hazard)
     fails=$(grep -aoE '[A-Za-z0-9_]+\([^()]*(\([^()]*\)[^()]*)*\): FAIL' "$D/hz.clean" | sed 's/: FAIL$//' | sort -u)
     grep -aqE '[1-9][0-9]*/[0-9]+ tests passed|0/[1-9][0-9]* tests passed' "$D/hz.clean" && ran=1
     f=0; [ $rc != 0 ] && { f=1; RC[$rc]=$(( ${RC[$rc]:-0} + 1 )); }; [ -n "$fails" ] && f=1
+    # upstream test-backend-ops exits 1 with this line when the filter selects nothing: not a failure, no test ran
+    [ $ran = 0 ] && [ -z "$fails" ] && grep -aq 'no test case matches the filters' "$D/hz.clean" && { f=0; RC[$rc]=$(( ${RC[$rc]} - 1 )); [ "${RC[$rc]}" = 0 ] && unset "RC[$rc]"; }
     echo "== hazard run $i/$N $(date -u +%T) rc=$rc $([ $f = 1 ] && echo FAILED || echo ok)"
     if [ $f = 1 ]; then k=$((k+1))
       while read -r c; do [ -n "$c" ] && CF[$c]=$(( ${CF[$c]:-0} + 1 )); done <<<"$fails"

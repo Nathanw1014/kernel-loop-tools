@@ -130,6 +130,9 @@ def all_waves(occ, rt):
         for w in ws:
             w["t0"], w["t1"] = f(w["begin"]), f(w["end"])
         out += ws
+    if not out:
+        sys.exit("wavetrace: no waves in this capture (empty submit, or a capture overwritten by a later one: check the driver's\n"
+                 "per-submit file naming and the capture size; `check` prints the trust counters)")
     base = min(w["t0"] for w in out)
     for w in out:
         w["t0"] -= base

@@ -48,7 +48,7 @@ fails=set()
 for l in sys.stdin:
     m=re.search(r'([A-Z_0-9]+\(.*\)):\s*FAIL\b',l)   # the case name and FAIL are on one line (prefixes like '[CONCAT] ERR = ...' allowed)
     if m: fails.add(m.group(1))
-print('\n'.join(sorted(fails)))"; }
+if fails: print('\n'.join(sorted(fails)))"; }   # nothing (not an empty line) when nothing failed: wc -l counts lines
 knob_lines(){ grep -vE '^\s*(#|$)' $KNOBS | sed 's/#.*//'; }
 
 say "=== batch: base $BASE  tip $TIP  knobs $(knob_lines | wc -l)"

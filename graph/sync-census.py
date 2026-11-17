@@ -23,4 +23,8 @@ for l in open(args[0], errors='replace'):
     if pend: cur['syncs'] += 1; cur['after'][op] += 1; pend = False
 big = [e for e in evals if e['nodes'] >= min_nodes]
 print(f"evals={len(evals)} big(>={min_nodes} nodes)={len(big)} per-big-eval nodes/syncs: " + ' '.join(f"{e['nodes']}/{e['syncs']}" for e in big[-4:]))
+if not big and evals:
+    print(f"no eval reaches {min_nodes} nodes (largest {max(e['nodes'] for e in evals)}): pass --min-nodes N below that "
+          "(small models and decode graphs are smaller than a full prefill graph)")
+if not evals: print('no sync-logger blocks found: was GGML_VK_SYNC_LOGGER=1 set, and is stderr in this file?')
 if big: print("sync -> next op (last big eval): " + ' '.join(f"{k}={v}" for k, v in big[-1]['after'].most_common(14)))

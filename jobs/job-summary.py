@@ -2,7 +2,7 @@
 """job-summary.py <OUT>: SUMMARY.txt for a job-run record dir.
 
 Bench cells named "<arm>.<rep>" are grouped by arm: per test the mean of the reps' avg_ts, the spread across reps
-(max-min) and the ratio to the FIRST arm in spec order. Everything is recomputed from cells/*/stdout.log (jsonl), so the
+(max-min) and the ratio to the FIRST arm in spec order that is not a warm-up (arms named warm* are listed, never the reference). Everything is recomputed from cells/*/stdout.log (jsonl), so the
 summary is reconstructable from the raw records."""
 import json, os, re, sys
 
@@ -43,9 +43,9 @@ for name, rc, dirty in order:
 
 if arms:
     names = list(arms)
-    base = names[0]
+    base = next((a for a in names if not a.startswith('warm')), names[0])   # a discarded warm-up arm is never the reference
     print(f"\nbench t/s: mean over reps (spread = max-min), ratio vs '{base}'; * = includes a DIRTY rep")
-    print(f"{'test':<16}" + "".join(f"{a:>24}" for a in names))
+    print(f"{'test':<16}" + "".join(f"  {a:>28}" for a in names))
     for t in tests:
         row = f"{t:<16}"
         b = arms[base].get(t)
@@ -53,11 +53,11 @@ if arms:
         for a in names:
             v = arms[a].get(t)
             if not v:
-                row += f"{'-':>24}"
+                row += f"  {'-':>28}"
                 continue
             m = sum(x for x, _ in v) / len(v)
             sp = max(x for x, _ in v) - min(x for x, _ in v)
-            r = f" {m / bm:.3f}x" if bm and a != base else ""
+            r = f" {m / bm:.3f}x" if bm and a != base and not a.startswith('warm') else ""
             cell = f"{m:.2f}±{sp:.2f}{'*' if any(d for _, d in v) else ''}{r} n{len(v)}"
-            row += f"{cell:>24}"
+            row += f"  {cell:>28}"
         print(row)
