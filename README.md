@@ -90,6 +90,27 @@ jobs/job-wait --marker my-label-DONE --file "$KLT_RESULTS/my/RESULTS.txt"
 - Never restart the queue service while a job runs (systemd kills its cgroup, job included):
   `job-queue hold`, `job-wait --lock-free`, restart, `job-queue release`.
 
+## Tested
+
+Every tool was run on one AMD RDNA 3.5 iGPU under Linux (RADV from a stock Mesa 26.2 release; ROCm for the HIP-only
+channel counters) against upstream llama.cpp master, with small models (0.6B to 7B). `--help` on every tool prints usage and
+does nothing else.
+
+- **Ran, with a control that had to fail and did:** the job verbs (`repeat` DIFFERS on a non-deterministic command,
+  `hazard` / `tbo` report NO TEST RAN on an empty filter, timeout, GATE, device-error STOP and refusal), queue lanes
+  (fast yield, share, hold / release / cancel, yield-file preempt and requeue), `abba.sh` self-vs-self (ratio 1.000),
+  KLD self 0 vs a quantised-KV control, `kldtool` diff, `bisect-pred.sh` good / skip / bad, `consist-gate` and
+  `repeat_gate` controls, `fa_masked_leak`, `topk_repeat`, `evcb-diff` (GPU vs GPU none, GPU vs CPU found),
+  `moe-route cmp`, `camp-hip` under the channel sampler (one channel 8.00 vs padded 1.00), the sharded `suite`
+  (partition check, then a cache hit with no GPU).
+- **Ran, output checked against a reference:** `perflog.py` (row sums equal the logger's own totals), the DRAM and
+  trace summarisers (same output as the tools they were derived from), `lds.py` (upstream's formula), `job-summary.py`,
+  `model-census.py`, `gguf-head.py`, SQTT occupancy capture, decode and summary, `vktrace.py` on a patched build.
+- **Not run on hardware:** `QOS_US` (only `check`'s refusal), SQTT timing mode (needs a patched Mesa), `tracecmp.py`
+  and `perflog.py xbackend` (need a HIP trace), `fusion-misses.py` / `split-bisect.py` / `fusion-family-bisect.sh`
+  (need patches; `fusion-census.py` was run on an existing dump), `percommit.sh`, `vkgemm`, `gcea-channels.py`,
+  `hip-loop-histo.py`.
+
 ## Licence
 
 MIT, see [LICENSE](LICENSE). Third-party code keeps its own licence (below).
