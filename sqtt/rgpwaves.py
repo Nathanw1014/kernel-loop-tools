@@ -6,8 +6,8 @@ Splits a RADV per-submit .rgp capture into the inputs rocprof-trace-decoder take
 RGP dispatch markers RADV writes into the stream (debug labels, pipeline binds, one
 event per hardware dispatch).
 
-Ported from the RGP reader of the MIT-licensed rocprof studio GUI (see third_party/LICENSE
-and third_party/PROVENANCE).
+Ported from the RGP reader of ROCprofGUI, https://github.com/pwilkin/ROCprofGUI (MIT; see
+third_party/LICENSE and third_party/PROVENANCE).
 
   rgpwaves.py extract capture.rgp outdir > outdir.extract.log
 
