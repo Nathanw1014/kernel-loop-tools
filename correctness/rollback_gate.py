@@ -2,7 +2,7 @@
 # rollback_gate.py: bit-exact cache rollback / checkpoint-restore invariance gate for llama-server.
 #
 #   rollback_gate.py --bin <llama-server> --model <gguf> --prompt-file <text> [--port N] [--out DIR]
-#                    [--min-avail-gb G] [--gtt-max-gib G] [--settle-s S] -- <server args>
+#                    [--min-avail-gb G] [--gtt-max-gib G] [--settle-s S] [--p-tokens N] [--arms LIST] -- <server args>
 #
 # Each gate arm runs on a FRESH server launch (one slot), so the cache layout is identical. Every arm runs the same request sequence with cache_prompt:true:
 #   Q (unrelated, resets the slot)  ->  P  ->  P+X (+G generated tokens)  ->  P+Y (+N generated)
@@ -20,7 +20,12 @@
 #             one-token change in the kept prefix; a leak of a whole branch is far larger)
 # n_probs output can be launch-dependent on some models; the null control (arm A on two launches) checks that here.
 # Before every launch: wait for other processes' GTT use <= --gtt-max-gib and MemAvailable >= --min-avail-gb, then --settle-s.
-# Refuses to start while $KLT_STOP exists. arms.json in --out holds every arm's stream (compare two runs: arms-compare.py).
+# --p-tokens N: length of the kept prefix P (default 1000). Deeper P puts the rollback point far into the context (a
+#   checkpoint at depth, a long-context attention path): P is the first N tokens of the file, the X pool the words after it,
+#   so a long prompt file is needed (the gate says how short it is). --arms null,short,long,control: run a subset; null and
+#   control are always kept (without them a verdict means nothing).
+# Refuses to start while $KLT_STOP exists. arms.json in --out holds every arm's stream and the setup (compare two runs:
+# arms-compare.py).
 import argparse, glob, json, os, subprocess, sys, time, urllib.request
 
 def klt_env(name, default):   # same defaults as lib/klt-env.sh
@@ -95,6 +100,45 @@ class Server:
         try: self.p.wait(60)
         except subprocess.TimeoutExpired: self.p.kill(); self.p.wait()
 
+def build_p_pool(port, words, p_tokens, pool_min):
+    """P and the X pool. p_tokens <= 1000: P from words[:700], pool from words[700:9000]. Deeper: P = the first p_tokens tokens
+    of a word slice from the file start (grown until long enough); the pool starts at the first word AFTER that slice, so X
+    and the control token never overlap P. Returns (P, pool, n_words_P, pool_word_range)."""
+    if p_tokens <= 1000:
+        return tok(port, " ".join(words[:700]))[:p_tokens], tok(port, " ".join(words[700:9000])), 700, (700, 9000)
+    nw = int(p_tokens * 1.2) + 50
+    while True:
+        if nw > len(words):
+            raise SystemExit(f"prompt file too short: {len(words)} words cannot make P = {p_tokens} tokens")
+        t = tok(port, " ".join(words[:nw]))
+        if len(t) >= p_tokens:
+            break
+        nw = int(nw * 1.3) + 50
+    P = t[:p_tokens]
+    nw2 = nw + 8300
+    while True:
+        pool = tok(port, " ".join(words[nw:nw2]))
+        if len(pool) >= pool_min:
+            break
+        if nw2 >= len(words):
+            raise SystemExit(f"prompt file too short: pool after word {nw} has {len(pool)} tokens, need {pool_min}")
+        nw2 = min(len(words), int(nw2 * 1.3))
+    return P, pool, nw, (nw, nw2)
+
+ARM_GROUPS = {"null": ("A1", "A2"), "short": ("B",), "long": ("L1", "L2"), "control": ("C",)}
+
+def parse_arms(s):
+    if s == "all":
+        return list(ARM_GROUPS)
+    sel = [x.strip() for x in s.split(",") if x.strip()]
+    bad = [x for x in sel if x not in ARM_GROUPS]
+    if bad:
+        raise SystemExit(f"--arms: unknown arm(s) {bad}; choose from {','.join(ARM_GROUPS)} or all")
+    added = [r for r in ("null", "control") if r not in sel]
+    if added:
+        print(f"[setup] --arms: added {','.join(added)} back (null and control are required for a valid gate)")
+    return [g for g in ARM_GROUPS if g in sel or g in added]
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True); ap.add_argument("--model", required=True)
@@ -105,8 +149,12 @@ def main():
                     help="MemAvailable floor before each launch (default 0 = off; set to the model's resident size plus a few GB)")
     ap.add_argument("--gtt-max-gib", type=int, default=2, help="wait until GPU GTT in use is at most this before each launch")
     ap.add_argument("--settle-s", type=int, default=30, help="sleep after the memory gate before each launch")
+    ap.add_argument("--p-tokens", type=int, default=1000, help="length of the kept prefix P in tokens (default 1000); "
+                    "deeper P comes from the file start, the X pool from the words after it")
+    ap.add_argument("--arms", default="all", help="comma subset of null,short,long,control (default all); null and control are always kept")
     ap.add_argument("server_args", nargs="*")
     a = ap.parse_args()
+    groups = parse_arms(a.arms)
     if os.path.exists(klt_env("KLT_STOP", "STOP-GPU")):
         print(f"ROLLBACK GATE: refusing to start, {klt_env('KLT_STOP', 'STOP-GPU')} exists (device error recorded)"); return 70
     os.makedirs(a.out, exist_ok=True)
@@ -114,10 +162,12 @@ def main():
     srv = Server(a, "tok")
     try:
         bos = post(a.port, "/tokenize", {"content": "", "add_special": True})["tokens"]
-        P = tok(a.port, " ".join(words[:700]))[:1000]
+        P, pool, nwp, prange = build_p_pool(a.port, words, a.p_tokens, max(5001, 3000 + a.long_x))
         Q = tok(a.port, "Unrelated reset prompt about gardening tools and soil.")
         Y = tok(a.port, "\n\nQuestion: summarise the passage above in two sentences.\nAnswer:")
-        pool = tok(a.port, " ".join(words[700:9000]))
+        meta = {"p_tokens": len(P), "p_words": nwp, "pool_words": list(prange), "pool_tokens": len(pool), "long_x": a.long_x, "arms": groups}
+        print(f"[setup] P = {len(P)} tokens (words[:{nwp}]), pool = {len(pool)} tokens (words[{prange[0]}:{prange[1]}]), "
+              f"long_x = {a.long_x}, arms = {','.join(groups)}")
         G, N = 16, 32
         X = lambda n, off: pool[off:off + n]
         # diagnostic, ONE launch: the same arm three times (fresh cache, then reused cells)
@@ -132,6 +182,8 @@ def main():
     P2 = list(P); P2[len(P2) // 2] = pool[5000]
     arms = {"A1": (P, X(48, 0)), "A2": (P, X(48, 0)), "B": (P, X(48, 3000)),
             "L1": (P, X(a.long_x, 0)), "L2": (P, X(a.long_x, 3000)), "C": (P2, X(48, 0))}
+    keep = {k for g in groups for k in ARM_GROUPS[g]}
+    arms = {k: v for k, v in arms.items() if k in keep}
     res = {}
     for name, (p, x) in arms.items():      # gate: every arm on a FRESH launch, identical cache layout
         srv = Server(a, name)
@@ -139,22 +191,23 @@ def main():
             res[name] = run_arm(a.port, bos, Q, p, x, Y, G, N)
         finally:
             srv.stop()
-    verdicts = []
+    verdicts = {}
     def cmp(name, x, y, must_match=True):
         i, u, v = first_diff(x, y)
         ok = (i is None) if must_match else (i is not None)
         det = "bit-identical" if i is None else f"first difference at generated token {i}: {u[:2] if u else u} vs {v[:2] if v else v}"
         print(f"[{name}] {'PASS' if ok else 'FAIL'} - {det} (cache_n {x['cache_n']}/{y['cache_n']}, prompt_n {x['prompt_n']}/{y['prompt_n']})")
-        verdicts.append(ok)
+        verdicts[name.split()[0]] = ok
     cmp("null    A vs A", res["A1"], res["A2"])
-    cmp("short   X1 vs X2", res["A1"], res["B"])
-    cmp("long    X1 vs X2", res["L1"], res["L2"])
+    if "short" in groups: cmp("short   X1 vs X2", res["A1"], res["B"])
+    if "long" in groups: cmp("long    X1 vs X2", res["L1"], res["L2"])
     cmp("control P vs P'", res["A1"], res["C"], must_match=False)
-    json.dump({"diag": [d1, d2, d3], **res}, open(os.path.join(a.out, "arms.json"), "w"))
-    if not verdicts[0]:
+    json.dump({"diag": [d1, d2, d3], **res, "meta": meta}, open(os.path.join(a.out, "arms.json"), "w"))
+    if not verdicts["null"]:
         print("ROLLBACK GATE: INVALID - null control differs across launches, results meaningless"); return 1
-    if not verdicts[3]:
+    if not verdicts["control"]:
         print("ROLLBACK GATE: INVALID - positive control did not differ"); return 1
+    verdicts = list(verdicts.values())
     print("ROLLBACK GATE: " + ("PASS - discarded branches never reach the kept state" if all(verdicts) else "FAIL - a discarded branch changed the result"))
     return 0 if all(verdicts) else 1
 

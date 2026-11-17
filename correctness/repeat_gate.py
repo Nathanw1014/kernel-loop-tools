@@ -13,6 +13,8 @@
 #   repeat_gate.py --bin ... --model ... --reps 8 --predict 48 --prompt-file p.txt
 #
 #   repeat_gate.py ... --lock            # take the GPU lock ($KLT_LOCK) yourself; omit when a runner already holds it
+#   repeat_gate.py --bin ... --model ... --multiturn --predict 800 [--prompt-file doc.txt] -- -c 16384
+#   repeat_gate.py --selftest            # classifier controls for --multiturn, no server
 #
 # exit status: 0 = PASS, 1 = FAIL. A difference in request 0 only is a FAIL by default (request-order
 # dependence); --allow-warmup downgrades it to WARN (exit 0). Refuses to start while $KLT_STOP exists.
@@ -215,6 +217,272 @@ def check(name: str, outs: list[str]) -> str:
     return "FAIL"
 
 
+# ---------------------------------------------------------------------------------------------
+# Multi-turn mode (--multiturn): the prompt cache and context checkpoints.
+#
+# The repeat gate above sends each request with cache_prompt:false, so it never exercises the
+# path real chat traffic takes: turn N+1 reuses turn N's KV (and, on hybrid/recurrent models,
+# restores a context checkpoint) and prefills only the new suffix. An edit-and-regenerate turn
+# is the only traffic that makes the server roll back to a checkpoint mid-history; plain appends
+# read the same whether --ctx-checkpoints is 1 or 32.
+#
+# Method: one conversation is run through /v1/chat/completions twice in one server process.
+#   phase 1 (cached):    turns 1..T appended in order with cache_prompt:true, then one edit turn
+#                        ([system, U1, A1, U2 edited]) so the divergence lands mid-history
+#   phase 2 (reference): the identical message lists again with cache_prompt:false, i.e. a full
+#                        re-prefill of each prompt
+# Each cached turn is compared with its reference. The two are NOT expected to be bit-identical:
+# a suffix prefill splits into different ubatches than a full one, and that moves logits at
+# numerical scale. So a divergence is classified with the logprobs at the first differing
+# position: if each side's chosen token is within --tie-eps nats of the other in BOTH streams it is
+# a near-tie flip (WARN); if the other side's token is far below, or absent from the top list, the
+# cached path computed something different (FAIL). Matching tokens whose logprob moved more than
+# --max-drift nats before the divergence also FAIL.
+#
+# Engagement is checked, not assumed: every append turn after the first must report a cache hit
+# covering at least the previous turn's prompt, otherwise the path under test never ran.
+
+MT_QUESTIONS = [
+    "Summarise the document above in three sentences.",
+    "Which people, places, dates or numbers does it mention? List them with one line each.",
+    "Continue the document with one more paragraph in the same style.",
+    "What questions does the document leave unanswered? Give three.",
+    "Rewrite the first paragraph for a ten-year-old reader.",
+    "Which statement in the document would be the hardest to verify, and why?",
+]
+MT_EDIT = "Which dates or numbers does it mention, and what does each one refer to?"
+MT_DEFAULT_DOC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts", "multiturn-doc.txt")
+
+
+def mt_chat(port: int, messages: list, predict: int, seed: int, cache_prompt: bool, nprobs: int,
+            no_think: bool = False) -> dict:
+    body = json.dumps({
+        "messages": messages,
+        "max_tokens": predict,
+        "temperature": 0,
+        "top_k": 1,
+        "seed": seed,
+        "cache_prompt": cache_prompt,
+        "logprobs": True,
+        "top_logprobs": nprobs,
+        **({"chat_template_kwargs": {"enable_thinking": False}} if no_think else {}),
+    }).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", body,
+                                 {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            js = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP-{e.code}: {e.read()[:200]!r}"}
+    except (urllib.error.URLError, ConnectionError, OSError) as e:
+        return {"error": f"DISCONNECT:{type(e).__name__}: {e}"}
+    ch = js["choices"][0]
+    msg = ch.get("message", {})
+    stream = []
+    for pos in ((ch.get("logprobs") or {}).get("content") or []):
+        cands = {c.get("id", c.get("token")): float(c["logprob"]) for c in pos.get("top_logprobs") or []}
+        tok = pos.get("id", pos.get("token"))
+        cands.setdefault(tok, float(pos["logprob"]))
+        stream.append((tok, float(pos["logprob"]), cands))
+    t = js.get("timings") or {}
+    u = js.get("usage") or {}
+    return {
+        "content": msg.get("content") or "",
+        "reasoning": msg.get("reasoning_content") or "",
+        "stream": stream,
+        "prompt_n": t.get("prompt_n"),
+        "cache_n": t.get("cache_n"),
+        "prompt_tokens": u.get("prompt_tokens"),
+        "completion_tokens": u.get("completion_tokens"),
+        "finish_reason": ch.get("finish_reason"),
+    }
+
+
+def mt_loop_period(text: str, span: int = 300, max_period: int = 200) -> int:
+    """Period of a repetition covering the last `span` chars of text, or 0. Catches a triple quote
+    repeated 400 times and sentence loops alike; normal prose never repeats exactly over 300 chars."""
+    if len(text) < span:
+        return 0
+    tail = text[-span:]
+    for p in range(1, max_period + 1):
+        if all(tail[i] == tail[i - p] for i in range(p, span)):
+            return p
+    return 0
+
+
+def mt_compare(cached: list, ref: list, tie_eps: float, max_drift: float) -> tuple:
+    """(verdict, detail) for two logprob streams of the same request. Streams are lists of
+    (token_id, logprob, {token_id: logprob}) per generated position."""
+    drift = 0.0
+    n = min(len(cached), len(ref))
+    for p in range(n):
+        tc, lc, cc = cached[p]
+        tr, lr, cr = ref[p]
+        if tc == tr:
+            drift = max(drift, abs(lc - lr))
+            if drift > max_drift:
+                return "FAIL", f"token {p} matches but its logprob moved {drift:.3f} nats (> --max-drift {max_drift})"
+            continue
+        # first differing token: how far below the winner was the loser, in each stream?
+        gap_ref = lr - cr[tc] if tc in cr else float("inf")     # reference's view of the cached pick
+        gap_cached = lc - cc[tr] if tr in cc else float("inf")  # cached path's view of the reference pick
+        gap = max(gap_ref, gap_cached)
+        where = f"token {p}/{n}, gaps ref {gap_ref:.4f} / cached {gap_cached:.4f} nats, prefix drift {drift:.2e}"
+        if gap <= tie_eps:
+            return "WARN", f"near-tie flip at {where}"
+        return "FAIL", f"divergence at {where} (> --tie-eps {tie_eps})"
+    if len(cached) != len(ref):
+        return "WARN", f"identical for {n} tokens, then one side stopped (lengths {len(cached)} vs {len(ref)}); prefix drift {drift:.2e}"
+    return "PASS", f"{n} tokens identical, max logprob drift {drift:.2e}"
+
+
+def mt_selftest() -> int:
+    """Positive and negative controls for the classifier, no server needed. Each case states what a
+    CORRECT classifier must return, so a broken one cannot pass by returning PASS everywhere."""
+    same = [(1, -0.1, {1: -0.1, 2: -3.0}), (5, -0.2, {5: -0.2, 6: -2.5})]
+    tie_a = [(1, -0.1, {1: -0.1, 2: -3.0}), (5, -0.690, {5: -0.690, 6: -0.700})]
+    tie_b = [(1, -0.1, {1: -0.1, 2: -3.0}), (6, -0.692, {6: -0.692, 5: -0.699})]
+    far_b = [(1, -0.1, {1: -0.1, 2: -3.0}), (9, -0.05, {9: -0.05, 8: -4.0})]           # ref never ranked 9
+    drift_b = [(1, -0.1, {1: -0.1, 2: -3.0}), (5, -1.9, {5: -1.9, 6: -2.0})]
+    cases = [
+        ("identical streams", same, same, "PASS"),
+        ("near-tie flip", tie_a, tie_b, "WARN"),
+        ("confident different token", far_b, same, "FAIL"),
+        ("same token, logprob moved 1.7 nats", drift_b, same, "FAIL"),
+        ("early stop, identical prefix", same[:1], same, "WARN"),
+    ]
+    bad = 0
+    for name, a, b, want in cases:
+        got, detail = mt_compare(a, b, 0.05, 1.0)
+        ok = got == want
+        bad += not ok
+        print(f"  {'ok  ' if ok else 'BAD '} {name}: want {want}, got {got} ({detail})")
+    loops = [('"' * 400, True), ("the cat sat on the mat. " * 20, True),
+             (open(MT_DEFAULT_DOC).read()[:2000] if os.path.exists(MT_DEFAULT_DOC) else "", False)]
+    for text, want in loops:
+        if not text:
+            continue
+        got = mt_loop_period(text) > 0
+        bad += got != want
+        print(f"  {'ok  ' if got == want else 'BAD '} loop detector on {text[:24]!r}...: want {want}, got {got}")
+    print(f"SELFTEST: {'PASS' if not bad else f'FAIL ({bad} wrong)'}")
+    return 1 if bad else 0
+
+
+def run_multiturn(args, log_path: str | None) -> int:
+    doc_path = args.prompt_file[0] if args.prompt_file else MT_DEFAULT_DOC
+    doc = open(doc_path).read().strip()
+    turns = max(2, min(args.turns, len(MT_QUESTIONS)))
+    nprobs = SUBTOKEN or 5
+    system = ("You answer questions about the document below. Answer from the document only.\n\n"
+              "DOCUMENT:\n" + doc)
+
+    # phase 1: the cached conversation, history built from the model's own answers
+    requests = []   # (label, messages, is_append_after_first)
+    cached = []
+    history = [{"role": "system", "content": system}]
+    empty_turns = 0
+    for t in range(turns):
+        history.append({"role": "user", "content": MT_QUESTIONS[t]})
+        msgs = list(history)
+        r = mt_chat(args.port, msgs, args.predict, args.seed, True, nprobs, args.no_think)
+        requests.append((f"turn{t + 1}", msgs, t > 0))
+        cached.append(r)
+        if "error" in r:
+            break
+        history.append({"role": "assistant", "content": r["content"]})
+        if not r["content"].strip():
+            empty_turns += 1
+        print(f"  cached turn{t + 1}: prompt {r['prompt_tokens']} tok, processed {r['prompt_n']}, "
+              f"cache {r['cache_n']}, generated {r['completion_tokens']} ({r['finish_reason']})", flush=True)
+    if all("error" not in r for r in cached) and len(history) >= 5:
+        msgs = history[:4] + [{"role": "user", "content": MT_EDIT}]    # [sys, U1, A1, U2 edited]
+        r = mt_chat(args.port, msgs, args.predict, args.seed, True, nprobs, args.no_think)
+        requests.append(("edit-regen", msgs, False))
+        cached.append(r)
+        if "error" not in r:
+            print(f"  cached edit-regen: prompt {r['prompt_tokens']} tok, processed {r['prompt_n']}, "
+                  f"cache {r['cache_n']}, generated {r['completion_tokens']} ({r['finish_reason']})", flush=True)
+
+    # phase 2: the same message lists, full re-prefill each
+    refs = [mt_chat(args.port, msgs, args.predict, args.seed, False, nprobs, args.no_think) for _, msgs, _ in requests]
+
+    verdicts = []
+    print()
+    prev_prompt = None
+    for (label, msgs, is_append), c, ref in zip(requests, cached, refs):
+        if "error" in c or "error" in ref:
+            print(f"[{label}] FAIL - request error: cached {c.get('error')} / reference {ref.get('error')}")
+            verdicts.append("FAIL")
+            continue
+        if not c["stream"] or len(next(iter(c["stream"]))[2]) < 2:
+            print(f"[{label}] ERROR - no top_logprobs in the response; refusing a vacuous verdict")
+            verdicts.append("FAIL")
+            continue
+        v, detail = mt_compare(c["stream"], ref["stream"], args.tie_eps, args.max_drift)
+        notes = []
+        # an append must reuse at least the previous request's prompt; a hybrid/recurrent model may
+        # re-process the previous answer (it resumes from a checkpoint before it), so the answer is
+        # not required to be cached. 64 tokens of slack for chat-template re-rendering at the seam.
+        if is_append and prev_prompt is not None:
+            if not c["cache_n"] or c["cache_n"] < prev_prompt - 64:
+                v = "FAIL"
+                notes.append(f"cache NOT used on an append turn (cached {c['cache_n']} of {c['prompt_tokens']}, "
+                             f"previous prompt was {prev_prompt}): the path under test did not run")
+        if label.startswith("turn"):
+            prev_prompt = c["prompt_tokens"]
+        if label == "edit-regen":
+            notes.append(f"edit reprocessed {c['prompt_n']} of {c['prompt_tokens']} tokens "
+                         f"({'full reset' if c['prompt_n'] == c['prompt_tokens'] else 'partial reuse'})")
+        lc = mt_loop_period(c["reasoning"] + c["content"])
+        lr = mt_loop_period(ref["reasoning"] + ref["content"])
+        if lc and not lr:
+            v = "FAIL"
+            notes.append(f"cached output ends in a period-{lc} loop the reference does not have")
+        elif lc:
+            notes.append(f"both sides loop (period {lc}/{lr}): the model, not the cache path")
+        print(f"[{label}] {v} - {detail}")
+        for n in notes:
+            print(f"  {n}")
+        verdicts.append(v)
+        if args.save_dir:
+            os.makedirs(args.save_dir, exist_ok=True)
+            for side, res in (("cached", c), ("ref", ref)):
+                with open(os.path.join(args.save_dir, f"mt-{label}.{side}.json"), "w") as f:
+                    json.dump({"messages": msgs, **res}, f)
+
+    if log_path:
+        try:
+            log = open(log_path, errors="replace").read()
+            n_cr = log.count("created context checkpoint")
+            n_rs = log.count("restored context checkpoint")
+            lv4 = any(a in ("-lv", "--log-verbosity", "--verbosity") and i + 1 < len(args.server_args)
+                      and args.server_args[i + 1] >= "4" for i, a in enumerate(args.server_args))
+            if n_cr or n_rs:
+                hint = ""
+            elif lv4:
+                hint = " (at -lv 4: expected for a pure-attention model, a defect for a hybrid/recurrent one)"
+            else:
+                hint = " (these lines only print at -lv 4; 0 here without it proves nothing)"
+            print(f"\nserver log {log_path}: {n_cr} checkpoints created, {n_rs} restored{hint}")
+        except OSError:
+            pass
+
+    if empty_turns:
+        print(f"\nNOTE: {empty_turns}/{turns} answers had empty content (reasoning used all of --predict), so the "
+              "history barely grew; raise --predict or pass --no-think for a conversation that builds up")
+    print()
+    if "FAIL" in verdicts:
+        print("MULTITURN GATE: FAIL - the cached/checkpointed path disagrees with a full re-prefill, or did not engage")
+        return 1
+    n_warn = verdicts.count("WARN")
+    if n_warn:
+        print(f"MULTITURN GATE: PASS with {n_warn} near-tie flip(s) - ubatch-shape numerics, within --tie-eps")
+        return 0
+    print("MULTITURN GATE: PASS - every cached turn matches its full re-prefill")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True, help="path to llama-server")
@@ -234,7 +502,21 @@ def main() -> int:
     ap.add_argument("--lock", nargs="?", const=klt_lock(), default=None, metavar="PATH",
                     help="take this flock (bare --lock: $KLT_LOCK) to serialise against other GPU jobs; "
                          "omit when the caller already holds the GPU lock, or this deadlocks")
+    ap.add_argument("--multiturn", action="store_true",
+                    help="multi-turn + edit-and-regenerate conversation, cached vs full re-prefill "
+                         "(see the comment block above run_multiturn); --prompt-file is the document, "
+                         "--predict the tokens per turn")
+    ap.add_argument("--turns", type=int, default=4, help="--multiturn: appended turns before the edit (2-6)")
+    ap.add_argument("--no-think", action="store_true",
+                    help="--multiturn: send chat_template_kwargs enable_thinking=false (reasoning models)")
+    ap.add_argument("--tie-eps", type=float, default=0.15,
+                    help="--multiturn: a divergence is a near-tie flip if both logprob gaps are within this many nats")
+    ap.add_argument("--max-drift", type=float, default=1.0,
+                    help="--multiturn: FAIL if a matching token's logprob moves more than this many nats")
+    ap.add_argument("--selftest", action="store_true", help="run the --multiturn classifier controls and exit")
     ap.add_argument("server_args", nargs="*", help="extra llama-server args after --")
+    if "--selftest" in sys.argv:
+        return mt_selftest()
     args = ap.parse_args()
     global CACHE_PROMPT
     CACHE_PROMPT = bool(args.cache_prompt)
@@ -263,11 +545,22 @@ def main() -> int:
     cmd = [args.bin, "-m", args.model, "--port", str(args.port),
            "--host", "127.0.0.1", "-np", "1"] + args.server_args
     print("+ " + " ".join(cmd), flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_path = log_f = None
+    if args.multiturn:
+        if args.save_dir:
+            os.makedirs(args.save_dir, exist_ok=True)
+            log_path = os.path.join(args.save_dir, "server.log")
+        else:
+            import tempfile
+            log_path = tempfile.mkstemp(prefix="repeat-gate-server-", suffix=".log")[1]
+        log_f = open(log_path, "w")
+    proc = subprocess.Popen(cmd, stdout=log_f or subprocess.DEVNULL, stderr=log_f or subprocess.DEVNULL)
     try:
         if not wait_healthy(args.port, proc, args.load_timeout):
             print("FAIL: server did not become healthy", file=sys.stderr)
             return 1
+        if args.multiturn:
+            return run_multiturn(args, log_path)
         verdicts = []
         sub_verdicts = []
         for name, prompt in prompts.items():
@@ -294,6 +587,8 @@ def main() -> int:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
+        if log_f:
+            log_f.close()
         if lock_fd:
             try:
                 os.unlink(args.lock + ".owner")
