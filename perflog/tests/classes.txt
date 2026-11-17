@@ -1,0 +1,5 @@
+# perflog --classes example: "class regex" per line, first match wins.
+# The regex is re.search-ed against the Vulkan row label or the HIP kernel name.
+gemm   \bMUL_MAT(_ID|_VEC)?\b|mul_mat|quantize_mmq
+attn   FLASH_ATTN|flash_attn
+rest   .

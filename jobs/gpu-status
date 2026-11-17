@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# gpu-status [-n N]: one compact status block for this machine, so a status check is ONE short call instead of a run of
+# tail / stat / cat polls. Shows: time (UTC + local), lock owner (+ alive / age), share-lane holders, yield file, GPU busy / GTT /
+# VRAM, MemAvailable, CPU Tctl / GPU edge / power, clocks vs the top DPM level, GPU-ish processes, and the N most recently written
+# files under $KLT_RESULTS (sampler noise skipped) with their last line. Read-only; never touches the lock.
+set -u
+. "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+N=3
+while [ $# -gt 0 ]; do case $1 in
+  -n) N=$2; shift 2;;
+  -h|--help) usage; exit 0;; *) echo "gpu-status: unknown arg $1" >&2; exit 2;; esac; done
+R=$KLT_RESULTS
+
+now=$(date -u +%H:%MZ); printf '== %s %s (%s)\n' "$(hostname)" "$now" "$(date '+%-I:%M %p %Z')"
+# lock
+lo=$(cat "$KLT_LOCK.owner" 2>/dev/null)
+if [ -z "$lo" ]; then echo "lock: free"
+else
+  pid=$(sed -nE 's/.*pid=([0-9]+).*/\1/p' <<<"$lo"); label=$(sed -nE 's/.*label=([^ ]+).*/\1/p' <<<"$lo")
+  started=$(sed -nE 's/.*started=([^ ]+).*/\1/p' <<<"$lo")
+  age=""; [ -n "$started" ] && age=$(( ($(date +%s) - $(date -d "$started" +%s 2>/dev/null || date +%s)) / 60 ))m
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then st=alive; else st="DEAD(stale owner?)"; fi
+  echo "lock: $label pid=$pid $st ${age:+held $age}$(sed -nE 's/.*( shared=[0-9]+( also=[^ ]+)?).*/\1/p' <<<"$lo")"
+fi
+# share lane: live shared holders of the lock
+sh=""; for f in "$KLT_HOME"/share.d/*; do [ -e "$f" ] || continue; read -r p l m ld cp t < "$f" 2>/dev/null
+  kill -0 "$p" 2>/dev/null && sh+="${sh:+ }$l(${m}G$([ "$ld" = 1 ] && echo ",load") $(( ($(date +%s) - ${t:-0}) / 60 ))m)"; done
+[ -n "$sh" ] && echo "share: $sh"
+YF=${KLT_YIELD_FILE:-$KLT_HOME/YIELD}; [ -e "$YF" ] && echo "yield: $YF exists ($(head -c 100 "$YF" 2>/dev/null | tr '\n' ' ')): no new cell starts"
+[ -e "$KLT_STOP" ] && echo "STOP: $KLT_STOP present: $(head -c 200 "$KLT_STOP" | tr '\n' ' ')"
+# GPU
+gpu=$(klt_gpu_card 2>/dev/null); [ -n "$gpu" ] && [ -r "$gpu/mem_info_gtt_used" ] || gpu=""
+if [ -n "$gpu" ]; then
+  busy=$(cat $gpu/gpu_busy_percent 2>/dev/null)
+  gtt=$(awk '{printf "%.1f", $1/2^30}' $gpu/mem_info_gtt_used); vram=$(awk '{printf "%.2f", $1/2^30}' $gpu/mem_info_vram_used)
+fi
+mem=$(awk '/MemAvailable/{printf "%d", $2/2^20}' /proc/meminfo)
+for d in /sys/class/hwmon/hwmon*; do case $(cat $d/name 2>/dev/null) in
+  k10temp|zenpower|coretemp) [ -z "${tctl:-}" ] && tctl=$(( $(cat $d/temp1_input 2>/dev/null || echo 0) / 1000 ));;
+  amdgpu) edge=$(( $(cat $d/temp1_input 2>/dev/null || echo 0) / 1000 )); pw=$(( $(cat $d/power1_average 2>/dev/null || cat $d/power1_input 2>/dev/null || echo 0) / 1000000 ));;
+esac; done
+echo "gpu: busy ${busy:-?}% gtt ${gtt:-?}G vram ${vram:-?}G | memavail ${mem}G | tctl ${tctl:-?}C edge ${edge:-?}C ${pw:-?}W | load $(cut -d' ' -f1 /proc/loadavg)"
+# clocks: current gfx / uclk (memory) / fclk / soc from gpu_metrics v3.0 (APU layout; SMU time-filtered), max = top pp_dpm level,
+# dpm = power_dpm_force_performance_level. LOW = GPU busy >= 50% but gfx < 90% of max. Other gpu_metrics versions are not decoded.
+if [ -n "$gpu" ] && [ -r $gpu/gpu_metrics ]; then
+  read -r gsz gfmt gcrev gclk gsoc gfclk guclk < <(od -An -tu2 -j0 -N2 $gpu/gpu_metrics | tr '\n' ' ';
+    od -An -tu1 -j2 -N2 $gpu/gpu_metrics | tr '\n' ' '; od -An -tu2 -j174 -N14 $gpu/gpu_metrics | awk '{print $1, $2, $5, $7}')
+  gmax=$(sed -nE 's/^[0-9]+: ([0-9]+)Mhz.*/\1/p' $gpu/pp_dpm_sclk 2>/dev/null | sort -n | tail -1)
+  umax=$(sed -nE 's/^[0-9]+: ([0-9]+)Mhz.*/\1/p' $gpu/pp_dpm_mclk 2>/dev/null | sort -n | tail -1)
+  if [ "$gfmt.$gcrev" = 3.0 ]; then
+    low=""; [ "${busy:-0}" -ge 50 ] && [ -n "$gmax" ] && [ $((gclk * 10)) -lt $((gmax * 9)) ] && low=" LOW(gfx<90% max while busy)"
+    echo "clk: gfx ${gclk}/${gmax:-?} MHz | mem(uclk) ${guclk}/${umax:-?} MHz | fclk ${gfclk} soc ${gsoc} | dpm $(cat $gpu/power_dpm_force_performance_level 2>/dev/null)$low"
+  else echo "clk: gpu_metrics v$gfmt.$gcrev not decoded"; fi
+fi
+# GPU-ish processes by exact comm (never pgrep -f; comm is cut at 15 chars)
+ps -eo pid=,etimes=,comm= | awk '$3 ~ /^(llama-bench|llama-server|llama-perplexit|llama-cli|test-backend-op|cmake|ninja|vulkaninfo|python3)$/ {
+    m=int($2/60); printf "%s%s(%s %s)", (n++?" ":"proc: "), $3, $1, (m>=60? int(m/60) "h" m%60 "m" : m "m") } END { if (n) print ""; else print "proc: none" }'
+# newest activity: most recently written files under the results root, skipping sampler / guard noise
+[ "$N" -gt 0 ] 2>/dev/null || exit 0
+echo "recent:"
+find "$R" -maxdepth 6 -type f -mmin -1440 \
+    ! -name '*.tsv' ! -name '*.smp' ! -name '*.therm' ! -name '*.jsonl' ! -name '*.owner' ! -name '*.released' ! -name '*.lock' \
+    ! -path '*/raw/*' ! -path '*/.git/*' ! -name '*.md' -size -50M -printf '%T@ %p\n' 2>/dev/null \
+  | sort -rn | head -n "$N" | while read -r t f; do
+    a=$(( ($(date +%s) - ${t%.*}) / 60 ))
+    last=$(tail -c 4000 "$f" 2>/dev/null | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' | grep -av '^[[:space:]]*$' | tail -1 | cut -c1-200)
+    printf '  %3dm %s: %s\n' "$a" "${f#$R/}" "$last"; done

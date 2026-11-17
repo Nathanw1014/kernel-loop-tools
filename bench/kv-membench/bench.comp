@@ -1,0 +1,168 @@
+#version 450
+//
+// Memory-pipeline microbenchmark kernel.
+//
+// mode 0 (stream): strided read. Thread t, iteration r reads element
+//     idx = stride*(t + r*nthreads)
+//   Within a subgroup, consecutive threads are `stride` elements apart, so
+//   `stride` is the coalescing knob: stride==1 -> fully coalesced,
+//   stride>=16 (>=64B) -> every thread its own cache line. The r-loop marches
+//   the whole [0,n) region exactly once with no overlap, so we measure useful
+//   bandwidth while traversing a fixed footprint.
+//
+// mode 1 (chase): dependent pointer chase, idx = data[idx]. One (or few)
+//   threads, R hops -> per-hop DRAM latency = time / R. data[] must hold a
+//   single-cycle permutation (built on the host with Sattolo's algorithm).
+//
+// mode 2 (mlp): MLP independent load streams per thread. Thread t, stream k,
+//   iteration r reads idx = stride*(k*nthreads + t + r*nthreads*MLP).
+//   Consecutive threads stay `stride` apart, so coalescing behaves exactly as
+//   in mode 0; what changes is that each thread now has MLP independent loads
+//   it can issue before consuming any of them. Sweeping MLP with the thread
+//   count held fixed separates a per-wavefront outstanding-load ceiling
+//   (saturates at the same MLP regardless of thread count) from a system-wide
+//   one (only nthreads*MLP matters). Each stream owns its own accumulator, so
+//   nothing serialises the loads. MLP is a specialization constant: it becomes
+//   a literal at pipeline creation, so the k-loop unrolls and the accumulators
+//   stay in registers rather than spilling to scratch.
+//
+layout(local_size_x = 256) in;
+
+// Independent loads in flight per thread. Only mode 2 reads this.
+layout(constant_id = 0) const uint MLP = 1u;
+
+layout(std430, binding = 0) readonly  buffer Data { uint data[]; };
+layout(std430, binding = 1) writeonly buffer Sink { uint sink[]; };
+
+// mode 3 (run): contiguous runs of `run` elements, interleaved `stride` ways.
+//   Logical position i maps to idx = (i/run)*(run*stride) + (i%run), and
+//   consecutive threads take consecutive i, so reads coalesce *within* a run and
+//   jump `run*stride` elements at every run boundary. run==1 degenerates to
+//   mode 0 at that stride; run >= the whole sweep is fully sequential. Sweeping
+//   `run` interpolates between the two and answers how long a contiguous run
+//   must be to recover coalesced bandwidth -- i.e. whether a paged KV cache
+//   that is head-contiguous only within a block still pays the stride tax.
+layout(push_constant) uniform PC {
+    uint nthreads;
+    uint stride;
+    uint reads;
+    uint mode;
+    uint run;        // contiguous run length in elements (power of two)
+    uint logrun;     // log2(run)
+    uint runstride;  // run * stride, precomputed on the host
+    uint nblocks;    // mode 7: number of row blocks
+    uint blocklog;   // mode 7: log2(rows per block)
+    uint slotmask;   // mode 7: head slots - 1 (power of two)
+} pc;
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.nthreads) return;
+
+    uint acc = 0u;
+
+    if (pc.mode == 0u) {
+        uint idx  = t * pc.stride;
+        uint step = pc.nthreads * pc.stride;
+        for (uint r = 0u; r < pc.reads; ++r) {
+            acc += data[idx];
+            idx += step;
+        }
+    } else if (pc.mode == 2u) {
+        // One accumulator per stream, so nothing serialises the loads: all MLP
+        // of them can be outstanding before the first result is consumed.
+        uint a[MLP];
+        for (uint k = 0u; k < MLP; ++k) a[k] = 0u;
+        uint lane = pc.nthreads * pc.stride;         // stream-to-stream offset
+        uint step = pc.nthreads * MLP * pc.stride;   // iteration-to-iteration
+        uint base = t * pc.stride;
+        for (uint r = 0u; r < pc.reads; ++r) {
+            for (uint k = 0u; k < MLP; ++k)
+                a[k] += data[base + k * lane];
+            base += step;
+        }
+        for (uint k = 0u; k < MLP; ++k) acc += a[k];
+    } else if (pc.mode == 4u) {
+        // mode 4 (streams): `stride` concurrent streams, each reading its own
+        // long sequential region, with region bases `runstride` elements apart.
+        // Every stream is perfectly coalesced on its own, so anything this
+        // measures is interference *between* streams -- the KV-cache case where
+        // per-head data is contiguous but the per-head stride is a power of two.
+        // run = threads per stream (power of two), logrun = log2(run).
+        uint g   = t >> pc.logrun;          // stream index
+        uint idx = g * pc.runstride + (t & (pc.run - 1u));
+        for (uint r = 0u; r < pc.reads; ++r) {
+            acc += data[idx];
+            idx += pc.run;
+        }
+    } else if (pc.mode == 5u) {
+        // mode 5 (swizzle): same footprint and same run length as mode 3, but the
+        // sub-slot read inside each period rotates with the block index instead of
+        // always being slot 0. Models storing head h of token t at slot
+        // (h XOR (t & (stride-1))): each run stays contiguous so coalescing is
+        // unchanged, but the period between successive runs stops being a clean
+        // power of two. Costs no extra memory, unlike a pad.
+        uint i = t;
+        for (uint r = 0u; r < pc.reads; ++r) {
+            uint block = i >> pc.logrun;
+            uint slot  = block & (pc.stride - 1u);
+            acc += data[block * pc.runstride + slot * pc.run + (i & (pc.run - 1u))];
+            i += pc.nthreads;
+        }
+    } else if (pc.mode == 6u) {
+        // mode 6 (gemv): G row-reader groups, one per weight-matrix row, like a
+        // mul_mat_vec dispatch. Group g, lane l reads row (g + k*G) for k in
+        // [0,reads): lanes stride across the row so reads coalesce within the
+        // group, rows sit `runstride` elements apart, and consecutive groups
+        // read consecutive rows -- so the instantaneous address set is many
+        // near-lockstep coalesced streams whose bases are runstride apart.
+        // stride = useful elements per row, run/logrun = lanes per group.
+        uint g = t >> pc.logrun;            // row-reader group index
+        uint l = t & (pc.run - 1u);         // lane within group
+        uint G = pc.nthreads >> pc.logrun;  // total groups
+        for (uint k = 0u; k < pc.reads; ++k) {
+            uint base = (g + k * G) * pc.runstride;
+            for (uint e = l; e < pc.stride; e += pc.run)
+                acc += data[base + e];
+        }
+    } else if (pc.mode == 7u) {
+        // mode 7 (gather): selected-key KV gather. Group g of `run` lanes reads
+        // `reads` rows; logical read q = g + k*G picks a pseudo-random block of
+        // 2^blocklog consecutive rows (sparse attention selects whole blocks), row stride
+        // `runstride` elements, and reads `stride` contiguous elements at head
+        // slot h = hash(q) & slotmask (offset h*stride inside the row).
+        uint g = t >> pc.logrun;
+        uint l = t & (pc.run - 1u);
+        uint G = pc.nthreads >> pc.logrun;
+        uint bm = (1u << pc.blocklog) - 1u;
+        for (uint k = 0u; k < pc.reads; ++k) {
+            uint q = g + k * G;
+            uint h = (q >> pc.blocklog) * 0x9E3779B1u;
+            h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+            uint row = ((h % pc.nblocks) << pc.blocklog) + (q & bm);
+            uint s = q * 0x85ebca6bu; s ^= s >> 13; s *= 0xc2b2ae35u; s ^= s >> 16;
+            uint base = row * pc.runstride + (s & pc.slotmask) * pc.stride;
+            for (uint e = l; e < pc.stride; e += pc.run)
+                acc += data[base + e];
+        }
+    } else if (pc.mode == 3u) {
+        // run is a power of two, so the run index and offset are a shift and a
+        // mask. A runtime integer divide here would cost ~30 ALU ops per load
+        // and risk making the loop ALU-bound rather than memory-bound.
+        uint i = t;
+        for (uint r = 0u; r < pc.reads; ++r) {
+            acc += data[((i >> pc.logrun) * pc.runstride) + (i & (pc.run - 1u))];
+            i += pc.nthreads;
+        }
+    } else {
+        uint idx = t;
+        for (uint r = 0u; r < pc.reads; ++r) {
+            idx  = data[idx];
+            acc ^= idx;
+        }
+    }
+
+    // Guarded store: the address is only touched on a value that (almost)
+    // never occurs, but the compiler can't prove it, so the loads survive DCE.
+    if (acc == 0xDEADBEEFu) sink[t] = acc;
+}

@@ -1,0 +1,87 @@
+#!/bin/bash
+# trace-run [--set S] [--out F.gz] [--comm GLOB] [--buf KB] [--] <cmd...>
+# Run <cmd> under a private tracefs instance, then dump the trace to F.gz (and F.cpu.tsv / F.meta.txt). Summarise with
+# analyze.py. Writes nothing to stdout (a caller can take the command's own last stdout line as its summary).
+# NEEDS passwordless sudo (sudo -n) for tracefs; without it the command runs untraced and F.meta.txt says SETUP_FAILED.
+# Env defaults: TRACE_SET (wake), TRACE_OUT (./trace.gz), TRACE_COMM (cmd basename, else llama-*), TRACE_BUF_KB (24576 per CPU),
+#               TRACE_EXTRA ("sys/event[:filter] ..." extra events), TRACE_DRYRUN=1 (print the root setup script, run nothing).
+# Sets (base = gpu_scheduler run/done, amdgpu cs/bo_move/bo_create/vm_flush, dma_fence waits, compaction, reclaim):
+#   base   base only
+#   freq   base + per-CPU freq/busy sampler (cpusamp.py)
+#   wake   base + sched_switch/sched_wakeup and ioctl enter/exit of COMM threads + sampler; D-state sleeps = blocking I/O. DEFAULT.
+#   io     wake + block_rq_issue/complete (all devices) + pread64/preadv/preadv2/io_uring_enter enter/exit of COMM threads
+#   wq     base + workqueue execute + kworker switch/wakeup
+#   sched  base + workqueue + ALL sched_switch/sched_wakeup + sampler. Can overrun its buffer and change the behaviour it
+#          measures: use only for short commands.
+#   all    io + wq (still COMM-filtered; not the unfiltered sched set)
+# Teardown: on exit / TERM / INT the instance is stopped, dumped and removed. A KILL skips that: the next trace-run removes
+# any klt-trace-<pid> instance whose pid is gone.
+set -u
+SET=${TRACE_SET:-wake}; OUTF=${TRACE_OUT:-$PWD/trace.gz}; COMM=${TRACE_COMM:-}; BUF=${TRACE_BUF_KB:-24576}
+while [ $# -gt 0 ]; do case $1 in
+  --set) SET=$2; shift 2;; --out) OUTF=$2; shift 2;; --comm) COMM=$2; shift 2;; --buf) BUF=$2; shift 2;; --) shift; break;; *) break;; esac; done
+[ $# -gt 0 ] || { sed -n '2,18p' "$0" >&2; exit 2; }
+D=$(dirname "$(readlink -f "$0")"); TR=/sys/kernel/tracing; I=$TR/instances/klt-trace-$$
+case $OUTF in *.gz) BASE=${OUTF%.gz};; *) BASE=$OUTF; OUTF=$OUTF.gz;; esac; META=$BASE.meta.txt
+if [ -z "$COMM" ]; then   # the real executable behind common wrappers; bash/python scripts -> llama-*
+  a=("$@"); i=0; while :; do b=${a[$i]##*/}; case $b in env|nice|setsid|stdbuf|taskset|numactl|timeout) i=$((i+1))
+    while [[ ${a[$i]:-} == -* || ${a[$i]:-} == *=* ]]; do i=$((i+1)); done; [ $b = timeout ] || [ $b = taskset ] && i=$((i+1));; *) break;; esac; done
+  case $b in bash|sh|python|python3|perl|'') COMM='llama-*';; *) COMM="${b:0:15}*";; esac; fi
+F_SW="prev_comm ~ \"$COMM\" || next_comm ~ \"$COMM\""; F_WK="comm ~ \"$COMM\""; F_SC="COMM ~ \"$COMM\""
+EV="gpu_scheduler/drm_sched_job_run gpu_scheduler/drm_sched_job_done amdgpu/amdgpu_cs_ioctl amdgpu/amdgpu_bo_move amdgpu/amdgpu_bo_create
+ amdgpu/amdgpu_vm_flush dma_fence/dma_fence_wait_start dma_fence/dma_fence_wait_end compaction/mm_compaction_begin compaction/mm_compaction_end
+ compaction/mm_compaction_kcompactd_wake compaction/mm_compaction_kcompactd_sleep compaction/mm_compaction_migratepages
+ vmscan/mm_vmscan_direct_reclaim_begin vmscan/mm_vmscan_direct_reclaim_end vmscan/mm_vmscan_kswapd_wake vmscan/mm_vmscan_kswapd_sleep
+ vmscan/mm_vmscan_throttled"
+FEV=()   # "event|filter" (filter may be empty)
+wake() { FEV+=("sched/sched_switch|$F_SW" "sched/sched_wakeup|$F_WK" "syscalls/sys_enter_ioctl|$F_SC" "syscalls/sys_exit_ioctl|$F_SC"); }
+io() { FEV+=("block/block_rq_issue|" "block/block_rq_complete|"); local s
+  for s in pread64 preadv preadv2 io_uring_enter; do FEV+=("syscalls/sys_enter_$s|$F_SC" "syscalls/sys_exit_$s|$F_SC"); done; }
+wq() { FEV+=("workqueue/workqueue_execute_start|" "workqueue/workqueue_execute_end|" "sched/sched_switch|prev_comm ~ \"kworker*\" || next_comm ~ \"kworker*\"" "sched/sched_wakeup|comm ~ \"kworker*\""); }
+SAMP=0
+case $SET in base) ;; freq) SAMP=1;; wake) wake; SAMP=1;; io) wake; io; SAMP=1;; wq) wq;;
+  sched) FEV+=("workqueue/workqueue_execute_start|" "workqueue/workqueue_execute_end|" "sched/sched_switch|" "sched/sched_wakeup|"); SAMP=1;;
+  all) wake; io; FEV+=("workqueue/workqueue_execute_start|" "workqueue/workqueue_execute_end|"); SAMP=1;;
+  *) echo "trace-run: unknown set '$SET' (base freq wake io wq sched all)" >&2; exit 2;; esac
+# wq + wake both filter sched_switch: merge the filters (one filter per event)
+merge() { local -A f; local k e x o=(); for x in "${FEV[@]}"; do e=${x%%|*}; k=${x#*|}
+    if [ -n "${f[$e]+y}" ]; then [ -z "${f[$e]}" ] || [ -z "$k" ] && f[$e]="" || f[$e]="(${f[$e]}) || ($k)"; else f[$e]=$k; o+=("$e"); fi; done
+  FEV=(); for e in "${o[@]}"; do FEV+=("$e|${f[$e]}"); done; }
+[ "$SET" = all ] && FEV+=("sched/sched_switch|prev_comm ~ \"kworker*\" || next_comm ~ \"kworker*\"" "sched/sched_wakeup|comm ~ \"kworker*\"")
+merge
+for x in ${TRACE_EXTRA:-}; do e=${x%%:*}; f=${x#*:}; [ "$f" = "$x" ] && f=""; FEV+=("$e|$f"); done
+
+{ echo "trace-run start=$(date -u +%FT%TZ) pid=$$ set=$SET comm=$COMM buf_kb=$BUF instance=$I"; echo "argv: $*"; } > "$META"
+# root part as one sh script per phase (fewer sudo calls; each write's failure is reported, not fatal)
+SW=$(mktemp)
+{ echo 'cd /sys/kernel/tracing/instances || exit 9'
+  echo 'for d in klt-trace-*; do [ -d "$d" ] || continue; p=${d#klt-trace-}; kill -0 "$p" 2>/dev/null && continue'
+  echo '  echo 0 > $d/tracing_on; for e in $(find $d/events -name enable); do echo 0 > $e 2>/dev/null; done; rmdir $d && echo "stale instance $d removed"; done'
+  echo "mkdir $I || exit 9"
+  echo "echo $BUF > $I/buffer_size_kb || echo 'BUF_FAIL $BUF'"
+  for e in $EV; do echo "echo 1 > $I/events/$e/enable 2>/dev/null || echo 'EV_FAIL $e'"; done
+  for x in "${FEV[@]}"; do e=${x%%|*}; f=${x#*|}
+    if [ -n "$f" ]; then echo "if printf '%s\\n' '$f' > $I/events/$e/filter 2>/dev/null; then echo 1 > $I/events/$e/enable 2>/dev/null || echo 'EV_FAIL $e'; else echo 'FILTER_FAIL $e (left off)'; fi"
+    else echo "echo 1 > $I/events/$e/enable 2>/dev/null || echo 'EV_FAIL $e'"; fi; done
+  echo "echo 1 > $I/tracing_on; echo \"START \$(date +%s.%N)\" > $I/trace_marker"; } > "$SW"
+[ "${TRACE_DRYRUN:-0}" = 1 ] && { cat "$SW"; rm -f "$SW" "$META"; exit 0; }   # print the root script only
+if ! sudo -n sh "$SW" >> "$META" 2>&1; then rm -f "$SW"; echo "trace-run: tracefs setup failed (sudo -n / instance), see $META; running untraced" >&2
+  echo "SETUP_FAILED: command ran untraced" >> "$META"; "$@"; exit $?; fi
+rm -f "$SW"
+SP=""; [ $SAMP = 1 ] && { python3 "$D/cpusamp.py" "$BASE.cpu.tsv" < /dev/null & SP=$!; }
+DONE=0
+teardown() { [ $DONE = 1 ] && return; DONE=1; [ -n "$SP" ] && kill $SP 2>/dev/null
+  sudo -n sh -c "echo END > $I/trace_marker; echo 0 > $I/tracing_on" 2>>"$META"
+  local t0=$(date +%s); sudo -n cat $I/trace | gzip > "$OUTF"
+  { echo "dump_s=$(( $(date +%s) - t0 )) bytes_gz=$(stat -c %s "$OUTF" 2>/dev/null)"
+    zcat "$OUTF" 2>/dev/null | head -5 | grep -o 'entries-in-buffer/entries-written: [0-9/]*'
+    sudo -n sh -c "cat $I/per_cpu/cpu*/stats" | awk '/^overrun/{o+=$2} /^dropped events/{d+=$3} END{print "overrun", o+0, "dropped", d+0}'; } >> "$META" 2>&1
+  sudo -n rmdir $I 2>>"$META" || sudo -n sh -c "echo 0 > $I/tracing_on; for e in \$(find $I/events -name enable); do echo 0 > \$e; done; rmdir $I" 2>>"$META"
+  echo "end=$(date -u +%FT%TZ)" >> "$META"; }
+trap teardown EXIT
+SIG=""; trap 'SIG=TERM; [ -n "${CPID:-}" ] && kill -TERM $CPID 2>/dev/null' TERM; trap 'SIG=INT; [ -n "${CPID:-}" ] && kill -INT $CPID 2>/dev/null' INT
+"$@" <&0 & CPID=$!
+while :; do wait $CPID; rc=$?; kill -0 $CPID 2>/dev/null || break; done
+echo "cmd rc=$rc${SIG:+ signal=$SIG}" >> "$META"
+teardown
+exit $rc

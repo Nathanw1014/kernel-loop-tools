@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# job-hazard: the cell body of the job-run verbs `hazard` and `repeat`. job-run runs it under the cell's lock / settle / setsid +
+# timeout / sampler, with KLT_CELL=<cell dir>. It also works by hand (records go to $KLT_CELL, default the current directory).
+#
+#   job-hazard hazard <N> <test-backend-ops> <args>   run the tbo command N times; test-backend-ops draws fresh random inputs on every
+#       launch (std::random_device in init_tensor_uniform), so N launches = N input sets. A run fails on rc != 0 OR any "...: FAIL" case
+#       line (count case lines, not ERR lines: ERR lines also appear for passing cases).
+#       Last line: "hazard k/N failed | <case> xK ... | rc <r> xK". Exit 1 if k > 0, 2 if no test case ran in any run (filter matched
+#       nothing and every run exited 0), else 0. Failing runs are kept as hazard-fail.<i>.log (first 10).
+#   job-hazard repeat <file|-> <cmd> <args>          run cmd REPEAT_N (default 2) times on the same binary and compare sha256 of its
+#       stdout (file "-") or of <file> (rewritten by each run, e.g. a --kl-divergence-base logits dump). Outputs kept as
+#       repeat.<i>.out / repeat.<i>.dat. Last line: "repeat identical sha=..." (exit 0) or "repeat DIFFERS ..." / "repeat EMPTY" /
+#       "repeat run i rc=r" (exit 1). Greedy / deterministic commands only: llama-simple prints tokens on stdout, logs on stderr.
+set -u
+mode=${1:-}; shift || true
+D=${KLT_CELL:-$PWD}; mkdir -p "$D"
+strip() { sed 's/\x1b\[[0-9;]*m//g'; }
+case $mode in
+hazard)
+  N=${1:?N}; shift; [ $# -gt 0 ] || { echo "hazard: no command"; exit 2; }
+  k=0; ran=0; kept=0; declare -A CF RC
+  for i in $(seq "$N"); do
+    "$@" > "$D/hz.cur" 2>&1; rc=$?
+    strip < "$D/hz.cur" > "$D/hz.clean"
+    fails=$(grep -aoE '[A-Za-z0-9_]+\([^()]*(\([^()]*\)[^()]*)*\): FAIL' "$D/hz.clean" | sed 's/: FAIL$//' | sort -u)
+    grep -aqE '[1-9][0-9]*/[0-9]+ tests passed|0/[1-9][0-9]* tests passed' "$D/hz.clean" && ran=1
+    f=0; [ $rc != 0 ] && { f=1; RC[$rc]=$(( ${RC[$rc]:-0} + 1 )); }; [ -n "$fails" ] && f=1
+    echo "== hazard run $i/$N $(date -u +%T) rc=$rc $([ $f = 1 ] && echo FAILED || echo ok)"
+    if [ $f = 1 ]; then k=$((k+1))
+      while read -r c; do [ -n "$c" ] && CF[$c]=$(( ${CF[$c]:-0} + 1 )); done <<<"$fails"
+      [ $kept -lt 10 ] && { cp "$D/hz.clean" "$D/hazard-fail.$i.log"; kept=$((kept+1)); }
+      grep -aE 'FAIL|ERR|rror|Lost|BO_VA|Abort|assert' "$D/hz.clean" | head -40
+    elif [ $i = 1 ]; then cat "$D/hz.clean"          # one full run for the record
+    else grep -aE 'tests passed|rror|Lost|BO_VA|Abort' "$D/hz.clean"; fi
+  done
+  rm -f "$D/hz.cur" "$D/hz.clean"
+  cs=""; for c in "${!CF[@]}"; do cs+="$c x${CF[$c]} ; "; done
+  rs=""; for r in "${!RC[@]}"; do rs+="rc $r x${RC[$r]} "; done
+  if [ $ran = 0 ] && [ $k = 0 ]; then echo "hazard NO TEST RAN in $N runs (filter matches no case?)"; exit 2; fi
+  echo "hazard $k/$N failed${cs:+ | ${cs% ; }}${rs:+ | $rs}"
+  [ $k = 0 ];;
+repeat)
+  O=${1:?file or -}; shift; [ $# -gt 0 ] || { echo "repeat: no command"; exit 2; }
+  n=${REPEAT_N:-2}; H=()
+  for i in $(seq "$n"); do
+    [ "$O" != - ] && rm -f "$O"
+    "$@" > "$D/repeat.$i.out" 2> "$D/repeat.$i.err"; rc=$?
+    cat "$D/repeat.$i.err" >&2       # job-run's device-error scan reads the cell stderr
+    # A file output is copied into the cell dir only when it is small (REPEAT_COPY_MAX bytes, default 256 MiB); a big one (a
+    # full-vocab logits dump can be many GB) is hashed where it is, so the records never fill the results disk.
+    if [ "$O" = - ]; then f="$D/repeat.$i.out"
+    elif [ "$(stat -c %s "$O" 2>/dev/null || echo 0)" -le "${REPEAT_COPY_MAX:-268435456}" ]; then f="$D/repeat.$i.dat"; cp "$O" "$f" 2>/dev/null || : > "$f"
+    else f="$O"; fi
+    h=$(sha256sum < "$f" | cut -c1-16); sz=$(stat -c %s "$f"); H+=("$h")
+    echo "== repeat run $i/$n $(date -u +%T) rc=$rc sha=$h bytes=$sz"
+    [ $rc != 0 ] && { echo "repeat run $i rc=$rc"; exit 1; }
+    [ "$sz" = 0 ] && { echo "repeat EMPTY output in run $i ($([ "$O" = - ] && echo stdout || echo "$O"))"; exit 1; }
+  done
+  for h in "${H[@]}"; do [ "$h" = "${H[0]}" ] || {
+    a=$([ "$O" = - ] && echo out || echo dat)
+    [ -e "$D/repeat.1.$a" ] && echo "first difference: $(cmp "$D/repeat.1.$a" "$D/repeat.2.$a" 2>&1 | head -1)"
+    echo "repeat DIFFERS: ${H[*]}"; exit 1; }; done
+  echo "repeat identical sha=${H[0]} ($n runs, $sz bytes, $([ "$O" = - ] && echo stdout || echo "$(basename "$O")"))";;
+*) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 2;;
+esac

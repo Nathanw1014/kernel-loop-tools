@@ -1,0 +1,32 @@
+synthetic fixture: serialising logger, a warm-up graph then a 2-split ubatch seen twice
+----------------
+Vulkan Timings:
+ADD: 2 x 10 us = 20 us
+MUL_MAT q4_K m=4096 n=512 k=4096: 2 x 2.5e+06 us = 5e+06 us (6.87110 GFLOPS/s)
+Total time: 5.00002e+06 us.
+  an indented tool note that is not a row: 3x
+----------------
+Vulkan Timings:
+FLASH_ATTN_EXT dst(128,32,512,1),  q(128,512,32,1),  k(128,512,8,1),  v(128,512,8,1),  m(512,512,1,1): 1 x 150 us = 150 us
+MUL_MAT q4_K m=4096 n=512 k=4096: 2 x 500 us = 1000 us (34355.5 GFLOPS/s)
+RMS_NORM_MUL RMS_NORM(4096,512,1,1): 2 x 25 us = 50 us
+Total time: 1200 us.
+----------------
+Vulkan Timings:
+GET_ROWS: 1 x 5 us = 5 us
+MUL_MAT_ID q4_K m=1024 n=8 k=4096 n_expert=64 batch=512: 1 x 300 us = 300 us
+MUL_MAT_VEC f16 m=32000 n=1 k=4096: 1 x 200 us = 200 us (1310.56 GFLOPS/s)
+Total time: 505 us.
+----------------
+Vulkan Timings:
+FLASH_ATTN_EXT dst(128,32,512,1),  q(128,512,32,1),  k(128,512,8,1),  v(128,512,8,1),  m(512,512,1,1): 1 x 150 us = 150 us
+MUL_MAT q4_K m=4096 n=512 k=4096: 2 x 500 us = 1000 us (34355.5 GFLOPS/s)
+RMS_NORM_MUL RMS_NORM(4096,512,1,1): 2 x 25 us = 50 us
+Total time: 1200 us.
+----------------
+Vulkan Timings:
+GET_ROWS: 1 x 5 us = 5 us
+MUL_MAT_ID q4_K m=1024 n=8 k=4096 n_expert=64 batch=512: 1 x 300 us = 300 us
+MUL_MAT_VEC f16 m=32000 n=1 k=4096: 1 x 210 us = 210 us (1248.15 GFLOPS/s)
+Total time: 515 us.
+{"n_batch": 512, "n_ubatch": 512, "n_prompt": 512, "n_gen": 0, "n_depth": 0, "avg_ns": 2000000, "avg_ts": 256000.0}

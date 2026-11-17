@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""stage-check: CPU-only pre-screen for queued optimisation ideas before they get GPU time.
+
+  stage-check 12 14 7            check ideas by id
+  stage-check --all              every idea whose status starts with "staged" (or "not started")
+  stage-check --text "IDEA ..."  check a draft idea before adding it
+  [--ideas PATH] [--dead PATH] [-v] [bar options below]
+
+Ideas file (--ideas or $KLT_IDEAS): a markdown table, one idea per row:
+  | id | idea | source | precondition | expected | status |
+"expected" holds the predicted gain, e.g. "-0.4 ms/token", "-30..-60 ms / 2048 ub", "+1.5% pp". Rows may contain extra '|'.
+
+Verdicts (one line per idea, rule cited):
+  DEAD           matches a dead-list rule (stage-check-dead.tsv)
+  BELOW-BAR      best case after the realisation ratio is under the build bar
+  MEASURE-FIRST  passes only at the optimistic end, or a dispatch-priced decode lever (positive control first)
+  BUILD          passes the build bar even at the pessimistic end
+  UNPARSED       no ms/% gain found in the expected column; read it by hand
+
+Bars (flag, env, default). Set the step times to your own model's measured values; the defaults are placeholders:
+  --token-ms     KLT_TOKEN_MS        20     decode time per token (ms); "ms/token" gains are divided by it
+  --ub-ms        KLT_UB_MS           2048:1000   prefill time per ubatch as size:ms[,size:ms...]; other sizes scale linearly
+  --build-pct    KLT_BUILD_PCT       0.5    smallest end-to-end gain (%) worth building
+  --on-pct       KLT_ON_PCT          1.0    gain (%) that justifies making a change the default
+  --class-ceil   KLT_CLASS_CEIL_PCT  7.0    claims above this (%) for one class of change are checked before building
+Realisation ratios (how much of an estimated gain a class of idea typically delivers in the model) are the CLASSES table below;
+tune them from your own verdicts.
+"""
+import argparse, os, re, sys
+
+DEAD = os.path.join(os.path.dirname(os.path.realpath(__file__)), "stage-check-dead.tsv")
+
+# Settings, filled in main() from flags / env. Every gain is compared as % of the step.
+TOKEN_MS = 20.0
+UB_MS = {2048: 1000.0}
+BUILD_PCT, ON_PCT = 0.5, 1.0
+CLASS_CEIL_PCT = 7.0
+KLD_NOTE = "lossy change: gate it on KLD vs a same-binary base before any speed claim"
+
+# (class, (pessimistic, optimistic) realisation ratio, keywords). Dispatch / launch-count arithmetic rarely shows up in the model;
+# byte-count arithmetic mostly does; host-side and measured per-call gaps sit in between.
+CLASSES = [
+    ("bytes", (0.7, 1.0), r"\bMB\b|\bGB\b|bytes|GB/s|bandwidth|repack|requant|q[2-8]_[0-9K]|\bf16\b|\bbf16\b|16-bit|layout"),
+    ("host", (0.5, 1.0), r"\bhost\b|\bsync|submit|fence|command buffer|\bCPU\b|served|llama-server|graph reuse|rebuild"),
+    ("prefill-gap", (0.5, 1.0), r"per call|per-call|vs HIP|vs CUDA|measured gap|\bgap\b"),
+    ("dispatch", (0.0, 0.3), r"dispatch|barrier|\bfold|\bfuse|fusion|epilogue|glue|elementwise|launch|regroup|pre-pass"),
+]
+DEFAULT_RATIO = ("unknown", (0.3, 1.0))
+NEGATE = re.compile(r"\b(dead|negative|neg\b|not\b|no longer|ruled out|closed|stop|fail)", re.I)
+NUM = r"[-+~]?\s*\d+(?:\.\d+)?"
+RANGE = rf"({NUM})(?:\s*(?:\.\.|-|to|\u2013)\s*({NUM}))?"
+
+
+def load_rows(path):
+    rows = {}
+    if not path:
+        return rows
+    for line in open(path, encoding="utf-8"):
+        if not re.match(r"^\|\s*\d+[a-z]?\s*\|", line):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 4:
+            continue
+        rid = cells[0]
+        # columns: id | idea | source | precondition | expected | status; long rows may contain extra '|'
+        status = cells[-1]
+        expected = cells[-2] if len(cells) >= 6 else ""
+        idea = " | ".join(cells[1:-4]) if len(cells) > 6 else cells[1]
+        rows[rid] = dict(id=rid, idea=idea, source=cells[2] if len(cells) > 2 else "", expected=expected, status=status)
+    return rows
+
+
+def load_dead(path):
+    rules = []
+    for line in open(path, encoding="utf-8"):
+        if not line.strip() or line.startswith("#"):
+            continue
+        kind, rx, cite = line.rstrip("\n").split("\t")[:3]
+        rules.append((kind, re.compile(rx, re.I), cite))
+    return rules
+
+
+def dead_hits(text, rules):
+    hits = []
+    for kind, rx, cite in rules:
+        for m in rx.finditer(text):
+            # ignore a mention inside a clause that already calls it dead / not / closed
+            a = max(text.rfind(".", 0, m.start()), text.rfind(";", 0, m.start()), m.start() - 80)
+            b = min([i for i in (text.find(".", m.end()), text.find(";", m.end())) if i >= 0] + [m.end() + 80])
+            if NEGATE.search(text[a:b]):
+                continue
+            hits.append((kind, m.group(0)[:40], cite))
+            break
+    return hits
+
+
+def fnum(s):
+    return abs(float(re.sub(r"[\s~+]", "", s).replace("\u2013", "-")))
+
+
+def ub_ms(ub):
+    if ub in UB_MS:
+        return UB_MS[ub]
+    k = min(UB_MS)
+    return UB_MS[k] * ub / k
+
+
+def parse_gain(text):
+    """Return (lo_pct, hi_pct, basis) from the first usable gain in text, or None."""
+    t = text.replace("\u2212", "-")
+    # ms per ubatch: "-55..-110 ms / 8192 ub", "-30 ms/ub", "ms per 2048"
+    mp = re.search(RANGE + r"\s*ms\s*(?:/|per)\s*(?:token|tok|round)", t)
+    mu = re.search(RANGE + r"\s*ms\s*(?:/\s*|per\s+)?(?:(\d{4})\s*)?(?:ub\b|ubatch)", t)
+    mpct = re.search(RANGE + r"\s*%", t)
+    if mp:
+        lo, hi = fnum(mp.group(1)), fnum(mp.group(2) or mp.group(1))
+        return sorted((lo / TOKEN_MS * 100, hi / TOKEN_MS * 100)) + ["ms/token"]
+    if mu:
+        ub = int(mu.group(3)) if mu.group(3) else min(UB_MS)
+        base = ub_ms(ub)
+        lo, hi = fnum(mu.group(1)), fnum(mu.group(2) or mu.group(1))
+        return sorted((lo / base * 100, hi / base * 100)) + [f"ms/{ub} ub" + ("" if mu.group(3) else " (ub assumed)")]
+    if mpct:
+        lo, hi = fnum(mpct.group(1)), fnum(mpct.group(2) or mpct.group(1))
+        # a % is a speed gain only when signed or next to tg/pp/t/s/wall; anything else may be a share or a hit rate
+        ctx = t[max(0, mpct.start() - 25):mpct.end()]
+        sure = re.search(r"[+-]\s*\d", mpct.group(0)) or re.search(r"\b(tg|pp|t/s|wall|faster|slower|decode|prefill)", ctx, re.I)
+        return sorted((lo, hi)) + ["%" if sure else "% (unclear basis)"]
+    mb = re.search(RANGE + r"\s*ms\b", t)  # bare "-0.40 ms": per token or per request is not stated
+    if mb:
+        lo, hi = fnum(mb.group(1)), fnum(mb.group(2) or mb.group(1))
+        return sorted((lo / TOKEN_MS * 100, hi / TOKEN_MS * 100)) + ["ms (unclear basis, read as per token)"]
+    return None
+
+
+def classify(text, basis):
+    # most keyword hits wins, ties by CLASSES order; prefill ideas with no class keyword take the prefill ratio
+    best, n = None, 0
+    for name, ratio, rx in CLASSES:
+        k = len(re.findall(rx, text, re.I))
+        if k > n:
+            best, n = (name, ratio), k
+    if best:
+        return best
+    return ("prefill-gap", (0.5, 1.0)) if " ub" in basis else DEFAULT_RATIO
+
+
+def check(row, rules, rows):
+    idea, exp = row["idea"], row["expected"]
+    text = f"{idea} {exp}"
+    notes = []
+    hits = dead_hits(text, rules)
+    dead = [h for h in hits if h[0] == "DEAD"]
+    notes += [f"WARN {h[2]}" for h in hits if h[0] == "WARN"]
+    if re.search(r"\bKLD|Q-class|quality|lossy", text, re.I) and not re.search(r"bit-exact|lossless|bit-identical", text, re.I):
+        notes.append(f"Q-class: {KLD_NOTE}")
+    for ref in sorted(set(re.findall(r"\b(?:rows?|ids?) (\d+)", text))):
+        r = rows.get(ref)
+        if r and re.search(r"NEG|FAIL|DEAD|dropped", r["status"], re.I):
+            notes.append(f"refs id {ref}: {r['status'][:60]}")
+    if dead:
+        return "DEAD", f"'{dead[0][1]}' -> {dead[0][2]}", notes
+    g = parse_gain(exp) or parse_gain(idea)
+    if not g:
+        return "UNPARSED", "no ms or % gain in expected", notes
+    lo, hi, basis = g
+    cname, (rlo, rhi) = classify(text, basis)
+    elo, ehi = lo * rlo, hi * rhi
+    why = f"{lo:.2f}-{hi:.2f}% ({basis}) x {cname} {rlo}-{rhi} = {elo:.2f}-{ehi:.2f}% vs build {BUILD_PCT}% / on {ON_PCT}%"
+    if re.search(r"ESTIMATE|unmeasured|\bif\b|arithmetic", exp, re.I):
+        why += ", estimate"
+    if ehi < BUILD_PCT:
+        return "BELOW-BAR", why, notes
+    if "unclear" in basis:
+        return "MEASURE-FIRST", why + "; gain basis unclear, state ms/token or ms per ub", notes
+    if lo > CLASS_CEIL_PCT:
+        return "MEASURE-FIRST", why + f"; above the {CLASS_CEIL_PCT}% per-class ceiling, check the claim", notes
+    if cname == "dispatch":
+        return "MEASURE-FIRST", why + "; dispatch-priced: run a positive control first (duplicate the dispatch, check the time moves as predicted)", notes
+    if elo >= BUILD_PCT and "estimate" not in why:
+        return "BUILD", why + ("; clears default-on" if elo >= ON_PCT else ""), notes
+    return "MEASURE-FIRST", why, notes
+
+
+def parse_ub(s):
+    out = {}
+    for part in s.split(","):
+        k, v = part.split(":")
+        out[int(k)] = float(v)
+    return out
+
+
+def main():
+    global TOKEN_MS, UB_MS, BUILD_PCT, ON_PCT, CLASS_CEIL_PCT
+    env = os.environ.get
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ids", nargs="*")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--text")
+    ap.add_argument("--ideas", default=env("KLT_IDEAS", ""), help="ideas table (markdown); default $KLT_IDEAS")
+    ap.add_argument("--dead", default=DEAD)
+    ap.add_argument("--token-ms", type=float, default=float(env("KLT_TOKEN_MS", "20")))
+    ap.add_argument("--ub-ms", default=env("KLT_UB_MS", "2048:1000"))
+    ap.add_argument("--build-pct", type=float, default=float(env("KLT_BUILD_PCT", "0.5")))
+    ap.add_argument("--on-pct", type=float, default=float(env("KLT_ON_PCT", "1.0")))
+    ap.add_argument("--class-ceil", type=float, default=float(env("KLT_CLASS_CEIL_PCT", "7.0")))
+    ap.add_argument("-v", action="store_true", help="print the idea text")
+    a = ap.parse_args()
+    TOKEN_MS, BUILD_PCT, ON_PCT, CLASS_CEIL_PCT = a.token_ms, a.build_pct, a.on_pct, a.class_ceil
+    try:
+        UB_MS = parse_ub(a.ub_ms)
+    except ValueError:
+        ap.error(f"bad --ub-ms '{a.ub_ms}' (size:ms[,size:ms...])")
+    if (a.ids or a.all) and not a.ideas:
+        ap.error("give the ideas table with --ideas PATH or KLT_IDEAS")
+    rows, rules = load_rows(a.ideas), load_dead(a.dead)
+    todo = []
+    if a.text:
+        todo.append(dict(id="draft", idea=a.text, source="", expected="", status="draft"))
+        if not re.search(r"\b(?:rows?|ids?) \d+|supersedes|verdict", a.text, re.I):
+            print("draft: WARN name the id it supersedes or the dead verdict it does not contradict")
+    if a.all:
+        todo += [r for r in rows.values() if re.match(r"(staged|not started)", r["status"], re.I)]
+    for i in a.ids:
+        if i in rows:
+            todo.append(rows[i])
+        else:
+            print(f"{i}: no such id", file=sys.stderr)
+    if not todo:
+        ap.error("give ids, --all or --text")
+    counts = {}
+    for r in todo:
+        v, why, notes = check(r, rules, rows)
+        counts[v] = counts.get(v, 0) + 1
+        name = re.split(r"[:(]", r["idea"], 1)[0][:28]
+        print(f"{r['id']:>5} {v:<13} {name:<28} {why}")
+        for n in notes:
+            print(f"{'':>20}{n}")
+        if a.v:
+            print(f"{'':>20}idea: {r['idea'][:300]}\n{'':>20}expected: {r['expected'][:200]}")
+    if len(todo) > 1:
+        print("summary: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+
+
+if __name__ == "__main__":
+    main()

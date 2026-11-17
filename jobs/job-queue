@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# job-queue: FIFO queue of job-run specs for this machine, drained by the user unit kernel-loop-queue.service, so the queue runs with
+# no agent attached.
+#   job-queue submit <spec.job>       check the spec (job-run check), enqueue it, print the id and the job-wait line to use
+#   job-queue ls                      pending / running / last 8 finished, with rc
+#   job-queue cancel <id>             drop a pending job, or TERM a running one (its cell is killed, lock released)
+#   job-queue bump <id> [--before|--after <id2>]   move a pending job to the front / next to another (re-bump ok)
+#   job-queue hold [reason] / release drain: park pending + new submits in held/, running job finishes
+#   job-queue daemon                  the service loop (one job at a time; idles while the STOP file exists)
+#   job-queue daemon-fast             the fast-lane loop (FAST=1 specs, one at a time); submit starts it on demand as the transient
+#                                     user unit kernel-loop-queue-fast (systemd-run --user; no unit file, own cgroup)
+#   job-queue daemon-share            the share-lane loop (spec-wide SHARE=1, not FAST; up to SHARE_SLOTS=2 jobs at once, their cells
+#                                     take the GPU lock shared); on demand as the transient unit kernel-loop-queue-share
+# Jobs live in $KLT_QUEUE/{pending,running,done,failed}/<id>.job (+ <id>.log = job-run console); FAST=1 specs (job-run check: cell
+# timeouts <= 1200 s, no HOLD_LOCK) in fast/{pending,running}/, finished ones in the same done/ failed/. A FAST job runs while a
+# normal job runs: the normal job yields the GPU lock between its cells, never inside a HOLD_LOCK block.
+# The transient units get the KLT_* / SUITE_* settings of the submitting shell (--setenv); the main unit needs them as Environment=.
+set -u
+. "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
+export KLT_ROOT KLT_HOME KLT_RESULTS KLT_LOCK KLT_STOP KLT_QUEUE KLT_VK_ICD KLT_GPU_CARD
+export RESULTS=$KLT_RESULTS   # short alias specs may use in OUT=
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+Q=$KLT_QUEUE; T=$(dirname "$(readlink -f "$0")")
+mkdir -p $Q/pending $Q/running $Q/done $Q/failed $Q/fast/pending $Q/fast/running $Q/share/pending $Q/share/running
+F=$Q/fast; SH=$Q/share; SHARE_SLOTS=${SHARE_SLOTS:-2}
+cmd=${1:-}; shift || true
+args=("$@")
+# every KLT_* / SUITE_* setting (and SHARE_SLOTS) of this shell, as systemd-run --setenv flags for the transient lane daemons
+unitenv() { local v; for v in $(compgen -v | grep -E '^(KLT_[A-Z0-9_]+|SUITE_[A-Z0-9_]+|SHARE_SLOTS)$'); do printf -- '--setenv=%s=%s\n' "$v" "${!v}"; done; }
+fastd_pid() { local p; p=$(cat $F/.pid 2>/dev/null) && [ -n "$p" ] && kill -0 "$p" 2>/dev/null && grep -qa daemon-fast /proc/$p/cmdline 2>/dev/null && echo "$p"; }
+shared_pid() { local p; p=$(cat $SH/.pid 2>/dev/null) && [ -n "$p" ] && kill -0 "$p" 2>/dev/null && grep -qa daemon-share /proc/$p/cmdline 2>/dev/null && echo "$p"; }
+lane_ensure() {   # $1 = fast|share: start that lane's daemon if it is not running (transient unit: survives this shell, separate from the main unit)
+  local lane=$1 dir pidf; dir=$F; pidf=fastd_pid; [ "$lane" = share ] && { dir=$SH; pidf=shared_pid; }
+  $pidf >/dev/null && return 0
+  local ev; mapfile -t ev < <(unitenv)
+  systemctl --user reset-failed kernel-loop-queue-$lane.service >/dev/null 2>&1
+  systemd-run --user --quiet --collect --unit=kernel-loop-queue-$lane -p Description="job-queue $lane lane" "${ev[@]}" /bin/bash $T/job-queue daemon-$lane >/dev/null 2>&1 \
+    || setsid nohup bash $T/job-queue daemon-$lane >> $dir/daemon.log 2>&1 < /dev/null &
+  sleep 1; $pidf >/dev/null && echo "job-queue: $lane-lane daemon started" || echo "WARN: $lane-lane daemon did not start (see $dir/daemon.log)"; }
+
+case $cmd in
+submit)
+  s=${args[0]:?spec}; [ -r "$s" ] || { echo "no spec $s"; exit 2; }
+  bash $T/job-run check "$s" || { echo "job-queue: not queued"; exit 2; }
+  lab=$(bash -c 'bench(){ :; }; tbo(){ :; }; ppl(){ :; }; run(){ :; }; cpu(){ :; }; build(){ :; }; hazard(){ :; }; repeat(){ :; }; suite(){ :; }; FAST=0; SHARE=0; . "$1" >/dev/null; echo "$LABEL|${FAST:-0}|${SHARE:-0}|$OUT"' _ "$s" 2>/dev/null | tail -1)
+  L=${lab%%|*}; O=${lab#*|}; FA=${O%%|*}; O=${O#*|}; SA=${O%%|*}; O=${O#*|}; O=${O/#\~/$HOME}; [ "$FA" = 1 ] && SA=0
+  for d in pending running fast/pending fast/running share/pending share/running held held/fast held/share; do ls $Q/$d/*-"$L".job >/dev/null 2>&1 && { echo "job-queue: a job labelled $L is already ${d/\//-}"; exit 2; }; done
+  grep -qE " ($L-DONE|START $L )" "$O/RESULTS.txt" 2>/dev/null && echo "job-queue: WARN $O/RESULTS.txt already has $L lines (new ones append; job-wait only counts new lines)"
+  id=$(date -u +%Y%m%dT%H%M%SZ)-$L; dest=pending; [ "$FA" = 1 ] && dest=fast/pending; [ "$SA" = 1 ] && dest=share/pending
+  [ -e $Q/.hold ] && { dest=held; [ "$FA" = 1 ] && dest=held/fast; [ "$SA" = 1 ] && dest=held/share; mkdir -p $Q/$dest; echo "job-queue: queue is HELD ($(cat $Q/.hold)); job parked in $dest/, starts after: job-queue release"; }
+  cp "$s" $Q/$dest/$id.job
+  run=$(ls $Q/running/*.job 2>/dev/null | xargs -r -n1 basename)
+  if [ "$SA" = 1 ]; then np=$(ls $SH/pending | wc -l); sr=$(ls $SH/running/*.job 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')
+    echo "queued SHARE $id (share-lane position $np${sr:+, share running: $sr}${run:+; normal lane running: $run}; cells take the lock shared, wait while an exclusive cell runs)"
+    [ "$dest" = share/pending ] && lane_ensure share
+    echo "wait: job-wait --file $O/RESULTS.txt --marker $L-DONE --timeout 24h"
+  elif [ "$FA" = 1 ]; then np=$(ls $F/pending | wc -l); fr=$(ls $F/running/*.job 2>/dev/null | xargs -r -n1 basename)
+    echo "queued FAST $id (fast-lane position $np${fr:+, fast running: $fr}${run:+; runs between the cells of: $run})"
+    [ "$dest" = fast/pending ] && lane_ensure fast
+    echo "wait: job-wait --file $O/RESULTS.txt --marker $L-DONE --timeout 3h"
+  else np=$(ls $Q/pending | wc -l)
+    echo "queued $id (position $np${run:+, running: $run})"
+    systemctl --user is-active -q kernel-loop-queue.service || echo "WARN: kernel-loop-queue.service is not running (a human starts it: systemctl --user start kernel-loop-queue)"
+    echo "wait: job-wait --file $O/RESULTS.txt --marker $L-DONE --timeout 24h"; fi;;
+ls)
+  echo "== queue $Q $( [ -e "$KLT_STOP" ] && echo "(STOP file present: $(cat "$KLT_STOP"))")"
+  for f in $Q/running/*.job; do [ -e "$f" ] && echo "running  $(basename $f .job)  $(tail -1 ${f%.job}.log 2>/dev/null | cut -c1-140)"; done
+  for f in $Q/pending/*.job; do [ -e "$f" ] && echo "pending  $(basename $f .job)"; done
+  fp=$(fastd_pid); echo "-- fast lane: daemon $([ -n "$fp" ] && echo "pid $fp" || echo "not running (submit starts it)")$(o=$(cat $KLT_HOME/fastwant 2>/dev/null); [ -n "$o" ] && kill -0 ${o%% *} 2>/dev/null && echo "; normal jobs yield to: ${o#* }")"
+  for f in $F/running/*.job; do [ -e "$f" ] && echo "fast-run $(basename $f .job)  $(tail -1 ${f%.job}.log 2>/dev/null | cut -c1-140)"; done
+  for f in $F/pending/*.job; do [ -e "$f" ] && echo "fast-pnd $(basename $f .job)"; done
+  sp=$(shared_pid); if [ -n "$sp" ] || ls $SH/running/*.job $SH/pending/*.job >/dev/null 2>&1; then
+    echo "-- share lane: daemon $([ -n "$sp" ] && echo "pid $sp" || echo "not running (submit starts it)") slots $SHARE_SLOTS"
+    for f in $SH/running/*.job; do [ -e "$f" ] && echo "share-run $(basename $f .job)  $(tail -1 ${f%.job}.log 2>/dev/null | cut -c1-140)"; done
+    for f in $SH/pending/*.job; do [ -e "$f" ] && echo "share-pnd $(basename $f .job)"; done; fi
+  for f in $KLT_HOME/share.d/*; do [ -e "$f" ] || continue; read -r p l m ld cp t < "$f" 2>/dev/null
+    kill -0 "$p" 2>/dev/null && echo "share-holder $l mem=${m}G load=$ld pid=$p cp=$cp since $(( ($(date +%s) - ${t:-0}) / 60 ))m"; done
+  [ -e "${KLT_YIELD_FILE:-$KLT_HOME/YIELD}" ] && echo "YIELD: ${KLT_YIELD_FILE:-$KLT_HOME/YIELD} exists, no new cell starts"
+  [ -e $Q/.hold ] && echo "HELD: $(cat $Q/.hold)"; for f in $Q/held/*.job $Q/held/fast/*.job $Q/held/share/*.job; do [ -e "$f" ] && echo "held     $(basename $f .job)$([[ $f == */fast/* ]] && echo " (FAST)")$([[ $f == */share/* ]] && echo " (SHARE)")"; done
+  ls -t $Q/done/*.job $Q/failed/*.job 2>/dev/null | head -8 | while read -r f; do
+    echo "$(basename $(dirname $f))$( [ $(basename $(dirname $f)) = done ] && echo '    ' || echo '  ') $(basename $f .job)  $(tail -1 ${f%.job}.log 2>/dev/null | cut -c1-120 | sed 's/rc=75$/rc=75 (preempted, requeued)/')"; done;;
+hold)
+  # Drain: park pending jobs in held/ (and route new submits there); the running job finishes. The daemon only reads pending/.
+  mkdir -p $Q/held/fast $Q/held/share; echo "$(date -u +%FT%TZ) ${args[*]:-held}" > $Q/.hold
+  for f in $Q/pending/*.job; do [ -e "$f" ] && mv "$f" $Q/held/; done
+  for f in $F/pending/*.job; do [ -e "$f" ] && mv "$f" $Q/held/fast/; done
+  for f in $SH/pending/*.job; do [ -e "$f" ] && mv "$f" $Q/held/share/; done
+  echo "HELD; held: $(ls $Q/held/*.job $Q/held/fast/*.job $Q/held/share/*.job 2>/dev/null | wc -l); running: $(ls $Q/running/*.job $F/running/*.job $SH/running/*.job 2>/dev/null | xargs -r -n1 basename || true)"
+  echo "drained when: job-wait --lock-free";;
+release)
+  for f in $Q/held/*.job; do [ -e "$f" ] && mv "$f" $Q/pending/; done; rm -f $Q/.hold
+  nf=0; for f in $Q/held/fast/*.job; do [ -e "$f" ] && { mv "$f" $F/pending/; nf=$((nf+1)); }; done
+  ns=0; for f in $Q/held/share/*.job; do [ -e "$f" ] && { mv "$f" $SH/pending/; ns=$((ns+1)); }; done
+  echo "released; pending: $(ls $Q/pending | wc -l), fast: $(ls $F/pending | wc -l), share: $(ls $SH/pending | wc -l)"; [ $nf -gt 0 ] && lane_ensure fast; [ $ns -gt 0 ] && lane_ensure share;;
+bump)
+  # job-queue bump <id> [--before <id2> | --after <id2>]: move a pending job to the very front, or right before / after another
+  # pending job, without cancel + resubmit; an already-bumped id can be bumped again. Renames only (job-queue-order.py computes
+  # them; the daemon runs `ls pending | sort | head -1`). Only while a job is running: the daemon is then inside wait, so the
+  # renames cannot race its pickup. Prints the new id(s).
+  id=${args[0]:?id}; mode=front; tgt=""
+  case ${args[1]:-} in --before) mode=before; tgt=${args[2]:?--before <id>};; --after) mode=after; tgt=${args[2]:?--after <id>};; "") ;; *) echo "bump: unknown option ${args[1]}"; exit 2;; esac
+  [ -e "$Q/pending/$id.job" ] || { echo "no pending job $id"; exit 1; }
+  ls $Q/running/*.job >/dev/null 2>&1 || { echo "job-queue: nothing running, the daemon may be picking now; retry in a minute"; exit 1; }
+  n0=$(ls $Q/pending/*.job | wc -l)
+  ren=$(ls $Q/pending/*.job | xargs -n1 basename | sed 's/\.job$//' | python3 $T/job-queue-order.py "$id" $mode $tgt) || exit 1
+  [ -z "$ren" ] && { echo "bump: $id is already there"; exit 0; }
+  while read -r o n; do mv -n "$Q/pending/$o.job" "$Q/pending/$n.job" && [ ! -e "$Q/pending/$o.job" ] || { echo "bump: rename $o -> $n FAILED"; exit 1; }
+    [ "$o" = "$id" ] && echo "bumped $id -> $n (${mode}${tgt:+ $tgt})" || echo "  renumbered $o -> $n (keeps its place)"; done <<<"$ren"
+  [ $(ls $Q/pending/*.job | wc -l) = $n0 ] || echo "bump: WARN pending count changed ($n0 -> $(ls $Q/pending/*.job | wc -l))"
+  echo "pending order:"; ls $Q/pending/*.job | sort | xargs -n1 basename | sed 's/\.job$//; s/^/  /';;
+cancel)
+  # TERM the job's children first: bash defers its TERM trap while a foreground child runs, so a job blocked in `flock` (waiting
+  # for the GPU lock) would ignore a plain TERM until it got the lock. Children dying lets job-run's own EXIT trap run (cleanup,
+  # records). KILL anything left after 20 s.
+  killtree() { local p=$1 all=() k; local q=($p); while [ ${#q[@]} -gt 0 ]; do k=${q[0]}; q=("${q[@]:1}"); all+=($k); q+=($(pgrep -P $k)); done
+    kill -0 $p 2>/dev/null || return 1; kill -TERM "${all[@]:1}" 2>/dev/null; kill -TERM $p 2>/dev/null
+    for i in $(seq 20); do kill -0 $p 2>/dev/null || return 0; sleep 1; done; kill -KILL "${all[@]}" 2>/dev/null; return 0; }
+  id=${args[0]:?id}
+  if [ -e $Q/pending/$id.job ]; then mv $Q/pending/$id.job $Q/failed/$id.job; echo "cancelled (pending) $id" | tee $Q/failed/$id.log
+  elif [ -e $F/pending/$id.job ]; then mv $F/pending/$id.job $Q/failed/$id.job; echo "cancelled (fast pending) $id" | tee $Q/failed/$id.log
+  elif [ -e $SH/pending/$id.job ]; then mv $SH/pending/$id.job $Q/failed/$id.job; echo "cancelled (share pending) $id" | tee $Q/failed/$id.log
+  elif [ -e $SH/running/$id.pid ]; then killtree $(cat $SH/running/$id.pid) && echo "sent TERM to share running $id and its children (filed under failed/)"
+  elif [ -e $Q/running/$id.pid ]; then killtree $(cat $Q/running/$id.pid) && echo "sent TERM to running $id and its children (the daemon files it under failed/)"
+  elif [ -e $F/running/$id.pid ]; then killtree $(cat $F/running/$id.pid) && echo "sent TERM to fast running $id and its children (filed under failed/)"
+  else echo "no pending/running job $id"; exit 1; fi;;
+daemon)
+  exec 8>$Q/.daemon.lock; flock -n 8 || { echo "job-queue daemon already running"; exit 1; }
+  echo "$(date -u +%FT%TZ) job-queue daemon start pid $$ queue $Q"
+  # a job left in running/ by a crash or reboot goes to failed/, never re-run silently
+  for f in $Q/running/*.job; do [ -e "$f" ] && { echo "$(date -u +%FT%TZ) orphaned $(basename $f) -> failed"; mv $f $Q/failed/; mv ${f%.job}.log $Q/failed/ 2>/dev/null; rm -f ${f%.job}.pid; }; done
+  while :; do
+    [ -e "$KLT_STOP" ] && { sleep 60; continue; }
+    j=$(ls $Q/pending/*.job 2>/dev/null | sort | head -1); [ -z "$j" ] && { sleep 10; continue; }
+    id=$(basename $j .job); mv $j $Q/running/; echo "$(date -u +%FT%TZ) run $id"
+    bash $T/job-run run $Q/running/$id.job > $Q/running/$id.log 2>&1 8>&- & echo $! > $Q/running/$id.pid; wait $!; rc=$?
+    echo "$(date -u +%FT%TZ) job-queue: rc=$rc" >> $Q/running/$id.log
+    d=done; [ $rc = 0 ] || d=failed; mv $Q/running/$id.job $Q/running/$id.log $Q/$d/; rm -f $Q/running/$id.pid
+    echo "$(date -u +%FT%TZ) $id rc=$rc -> $d"; done;;
+daemon-fast)
+  # same loop as daemon over fast/; own lock, own running dir (the main daemon's orphan sweep never touches it)
+  exec 8>$Q/.daemon-fast.lock; flock -w 60 8 || { echo "job-queue fast daemon already running"; exit 1; }
+  echo $$ > $F/.pid; echo "$(date -u +%FT%TZ) job-queue fast daemon start pid $$"
+  for f in $F/running/*.job; do [ -e "$f" ] && { echo "$(date -u +%FT%TZ) orphaned fast $(basename $f) -> failed"; mv $f $Q/failed/; mv ${f%.job}.log $Q/failed/ 2>/dev/null; rm -f ${f%.job}.pid; }; done
+  while :; do
+    [ -e "$KLT_STOP" ] && { sleep 60; continue; }
+    j=$(ls $F/pending/*.job 2>/dev/null | sort | head -1); [ -z "$j" ] && { sleep 5; continue; }
+    id=$(basename $j .job); mv $j $F/running/; echo "$(date -u +%FT%TZ) run fast $id"
+    bash $T/job-run run $F/running/$id.job > $F/running/$id.log 2>&1 8>&- & echo $! > $F/running/$id.pid; wait $!; rc=$?
+    echo "$(date -u +%FT%TZ) job-queue: rc=$rc (fast lane)" >> $F/running/$id.log
+    d=done; [ $rc = 0 ] || d=failed; mv $F/running/$id.job $F/running/$id.log $Q/$d/; rm -f $F/running/$id.pid
+    echo "$(date -u +%FT%TZ) fast $id rc=$rc -> $d"; done;;
+daemon-share)
+  # share lane: up to SHARE_SLOTS jobs at once (their cells take the GPU lock shared; job-run does admission). Own lock / running dir.
+  exec 8>$Q/.daemon-share.lock; flock -w 60 8 || { echo "job-queue share daemon already running"; exit 1; }
+  echo $$ > $SH/.pid; echo "$(date -u +%FT%TZ) job-queue share daemon start pid $$ slots $SHARE_SLOTS"
+  for f in $SH/running/*.job; do [ -e "$f" ] && { echo "$(date -u +%FT%TZ) orphaned share $(basename $f) -> failed"; mv $f $Q/failed/; mv ${f%.job}.log $Q/failed/ 2>/dev/null; rm -f ${f%.job}.pid; }; done
+  while :; do
+    [ -e "$KLT_STOP" ] && { sleep 60; continue; }
+    [ $(ls $SH/running/*.job 2>/dev/null | wc -l) -ge $SHARE_SLOTS ] && { sleep 5; continue; }
+    j=$(ls $SH/pending/*.job 2>/dev/null | sort | head -1); [ -z "$j" ] && { sleep 5; continue; }
+    id=$(basename $j .job); mv $j $SH/running/; echo "$(date -u +%FT%TZ) run share $id"
+    ( bash $T/job-run run $SH/running/$id.job > $SH/running/$id.log 2>&1 & echo $! > $SH/running/$id.pid; wait $!; rc=$?
+      echo "$(date -u +%FT%TZ) job-queue: rc=$rc (share lane)" >> $SH/running/$id.log
+      d=done; [ $rc = 0 ] || d=failed; mv $SH/running/$id.job $SH/running/$id.log $Q/$d/; rm -f $SH/running/$id.pid
+      echo "$(date -u +%FT%TZ) share $id rc=$rc -> $d" ) 8>&- &
+    sleep 3; done;;
+*) usage; exit 2;;
+esac

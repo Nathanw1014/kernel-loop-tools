@@ -1,0 +1,5 @@
+# batch-validate.sh knobs file: one feature OFF per line, "NAME=VALUE [NAME=VALUE ...]  # comment".
+# Each line is applied alone to the tip build. List the opt-out switch of every feature in the batch you are validating.
+# The names below exist in upstream ggml-vulkan; they are presence-tested (any value disables), so "=1" is just a convention.
+GGML_VK_DISABLE_FUSION=1            # example: all op fusion off
+GGML_VK_DISABLE_COOPMAT=1           # example: KHR_cooperative_matrix paths off

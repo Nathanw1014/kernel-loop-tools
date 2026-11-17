@@ -1,0 +1,31 @@
+#!/bin/bash
+# qos-run <us> <notes-file> -- <cmd> [args...]: run cmd while jobs/qoshold holds a PM QoS CPU latency request of <us> us
+# (job-run QOS_US=<us>). Idle cores then skip the idle states slower than <us> to leave (e.g. 100 us keeps cores out of C3).
+# Needs write access to /dev/cpu_dma_latency (root, or a udev rule giving your group access). The request is system-wide
+# while held; it dies with the helper, and the helper dies with this wrapper. Build the helper: gcc -O2 -o qoshold qoshold.c
+# Notes file: aggregate before / held / after, deepest-idle (C3) entries per second over the run, and a last line "qos ..." that
+# job-run puts in the RESULTS line. stdout / stderr are the command's only. rc = the command's (90 / 91 = no request, not run).
+set -u
+[ $# -ge 4 ] && [ "$3" = -- ] || { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 2; }
+US=$1; N=$2; shift 3
+T=$(dirname "$(readlink -f "$0")"); Q=$T/qoshold
+say() { echo "$(date -u +%FT%TZ) $*" >> "$N"; }
+c3() { local s=0 d; for d in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state[0-9]*; do
+    [ "$(cat "$d/name")" = C3 ] && s=$((s + $(cat "$d/usage"))); done; echo $s; }
+QB=$("$Q" read 2>> "$N") || { echo "qos FAILED (cannot read /dev/cpu_dma_latency), cell not run" >> "$N"; exit 90; }
+"$Q" hold "$US" $$ >> "$N" 2>&1 &
+QP=$!
+sleep 0.3
+QA=$("$Q" read 2>> "$N")
+[ -n "$QA" ] && [ "$QA" -le "$US" ] || { kill "$QP" 2>/dev/null; wait "$QP" 2>/dev/null; echo "qos FAILED (aggregate ${QA:-unreadable}, wanted <= $US), cell not run" >> "$N"; exit 91; }
+say "request $US us uid=$(id -u) aggregate before=$QB held=$QA holder_pid=$QP"
+C0=$(c3); T0=$(date +%s.%N)
+"$@"; RC=$?
+C1=$(c3); T1=$(date +%s.%N)
+QH=$("$Q" read 2>> "$N")
+kill "$QP" 2>/dev/null; wait "$QP" 2>/dev/null
+QE=$("$Q" read 2>> "$N")
+RATE=$(awk -v n=$((C1 - C0)) -v a="$T0" -v b="$T1" 'BEGIN{printf "%.0f", n / (b - a)}')
+say "C3 entries, all CPUs: $((C1 - C0)) = $RATE/s; aggregate at the end of the run=$QH, after release=$QE (before $QB); rc=$RC"
+echo "qos ${US}us held=$QA end=$QH c3 $RATE/s $([ "$QE" = "$QB" ] && echo restored || echo "after=$QE(before $QB)")" >> "$N"
+exit $RC

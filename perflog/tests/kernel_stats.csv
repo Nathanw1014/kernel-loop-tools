@@ -1,0 +1,6 @@
+"Name","Calls","TotalDurationNs","AverageNs","Percentage","MinNs","MaxNs","StdDev"
+"void mul_mat_q<(ggml_type)12, 128, false, false>(char const*, int)",4,4000000,1000000,83.2,900000,1100000,0
+"void quantize_mmq_q8_1<false>(float const*, int)",4,400000,100000,8.3,90000,110000,0
+"void flash_attn_ext_f16<128, 128>(char const*, int)",2,300000,150000,6.2,140000,160000,0
+"void rms_norm_f32<256>(float const*, float*, int)",2,100000,50000,2.1,40000,60000,0
+"k_get_rows_float(float const*, int const*, float*)",1,10000,10000,0.2,10000,10000,0

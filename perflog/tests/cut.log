@@ -1,0 +1,2 @@
+ADD: 4 x 10 us = 40 us
+MUL_MAT f16 m=64 n=64 k=64: 1 x 2 us = 2 us

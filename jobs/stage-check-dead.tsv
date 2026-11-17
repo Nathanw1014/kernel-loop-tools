@@ -1,0 +1,10 @@
+# stage-check dead list: ideas already tried and closed, so they never get GPU time again.
+# One rule per line, three TAB-separated fields: KIND<TAB>regex<TAB>citation
+#   KIND      DEAD (idea was measured and lost: verdict DEAD) or WARN (method trap: verdict unchanged, the note is printed)
+#   regex     Python regex, case-insensitive, matched on the idea + expected text of each row
+#   citation  where the verdict is written down (run id, note, issue link); every line needs one
+# A match inside a clause that already says dead / negative / not (within ~80 chars) is ignored, so ideas can cite a dead one.
+# Add a line for every verdict, nulls included. The lines below are synthetic examples: replace them with your own.
+DEAD	example-dead-idea|frobnicate the (widget|gadget) kernel	example: link your verdict note here
+DEAD	swap the foo and bar passes	example: run id of the A/B that lost, e.g. results/foo-bar-ab/SUMMARY.txt
+WARN	small-model (KLD|accuracy).{0,40}proxy	example: method note explaining why this proxy misleads

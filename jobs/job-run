@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+# job-run check|run <spec.job>: run a declarative GPU job with the lock, memory / thermal gates, settle, timeout, samplers, records
+# and device-error stop built in, so a job is a short spec instead of a hand-written runner. Queue: job-queue. Wait: job-wait.
+#
+# Spec = bash, sourced once to COLLECT cells (keep it declarative: assignments, exports, loops, cell lines; no side effects):
+#   LABEL=fa-rowmajor-ab          # [A-Za-z0-9_.-]+, used in the lock owner and the RESULTS markers
+#   OUT=$RESULTS/fa-rowmajor      # record dir (must be under $KLT_RESULTS, alias $RESULTS); cells go to OUT/cells/<name>/
+#   MEM_GB=45 SETTLE_S=30 TIMEOUT=3600 HOLD_LOCK=0 MESA=system   # MESA=release|system|<icd json> (defaults below)
+#   export GGML_VK_FOO=1          # applies to every cell
+#   bench <name> [VAR=v...] <llama-bench> <args>        llama-bench, -o jsonl added unless -o given; name "arm.rep" groups A/B arms
+#   tbo   <name> [VAR=v...] <test-backend-ops> <args>
+#   ppl   <name> [VAR=v...] <llama-perplexity> <args>  PPL / KLD summary
+#   run   <name> [VAR=v...] <cmd> <args>               any GPU command (settle + guards), summary = last output line
+#   cpu   <name> [VAR=v...] <cmd> <args>               CPU-heavy command: lock only, no settle (convert, quantize, scripts)
+#   build <name> [GATE=1] [TIMEOUT=s] <build-dir> [target...]   nice'd cmake --build under the lock (JOBS, default nproc)
+#   hazard <name> [N=40] [VAR=v...] <test-backend-ops> <args>   N launches, fresh random inputs each; "hazard k/N failed", rc 1 if k>0
+#   repeat <name> [REPEAT_OUT=<file>] [REPEAT_N=2] [VAR=v...] <cmd> <args>   same binary twice, sha256 of stdout (or of REPEAT_OUT)
+#       compared: "repeat identical" / "repeat DIFFERS" (rc 1). Both run jobs/job-hazard as the cell body.
+#   suite <name> [SUITE_SHARDS=n] [CACHE=auto|master|force|off] [VAR=v...] <test-backend-ops> <args>   one full test-mode run split
+#       into SUITE_SHARDS processes (default 8, MemAvailable-capped) balanced by the last op profile (jobs/job-suite, suite-plan.py;
+#       no profile yet = shards by op count). Not a timing cell: SHARE=1 by default (SHARE=0 token or HOLD_LOCK=1 = exclusive).
+#       Master cache: a clean, up-to-date build of a $SUITE_MASTER_REF commit hits the cache before the lock (no GPU).
+#   Per-cell VAR=v tokens are env for that cell only; TIMEOUT=<s> as a token sets that cell's timeout.
+#   GATE=1 cell token: if the cell fails (rc != 0, or SKIPPED) the job ends there ("GATE <name> failed"); put a tbo gate in front of
+#       timing / KLD cells so nothing is measured on a kernel that fails its tests.
+#   NOCHECK=<path,bin> cell token: skip that per-cell check (check only; never passed to the command).
+#   MEM_GB=<n> cell token: that cell's memory (settle threshold; share ledger).
+#   DRAM_SAMPLE=1 (spec or cell; DRAM_PERIOD_MS=50): mem/dram-sample.py on GPU cells -> cells/<name>/dram.tsv + RESULTS field.
+#   CHAN_SAMPLE=1 (spec or cell; CHAN_PERIOD_MS=100): per-channel DRAM requests (mem/chan-start.sh) -> chan.tsv + RESULTS field.
+#   TRACE=1|0|auto (spec, cell or KLT_TRACE; default 0; auto = on for decode-only bench cells, -p 0 -n N; TRACE_SET=wake|io|freq|base|wq|sched|all): run
+#       the cell under samplers/trace/trace-run (needs passwordless sudo; without it the cell runs untraced, "trace SETUP_FAILED").
+#   QOS_US=<us> (spec or cell, default 0 = off): run the cell under jobs/qos-run, which holds a PM QoS CPU latency request of <us> us
+#       (system-wide while held) -> cells/<name>/qos.txt + RESULTS field. Needs write access to /dev/cpu_dma_latency and a built
+#       jobs/qoshold (gcc -O2 -o qoshold qoshold.c). Not for cpu / build cells.
+#   FAST=1 (spec): fast lane (job-queue; check refuses summed cell timeouts > 1200 s or HOLD_LOCK=1). At each cell boundary a normal
+#       job lets ONE fast job through, then takes its turn; budget YIELD_MAX=1800 s across consecutive yields. A HOLD_LOCK=1 block
+#       never yields mid-block. Logged in the cell's gate field ("yielded Ns to fast <label>").
+#   SHARE=1 (cell token or spec-wide): a NON-TIMING cell takes the lock shared (flock -s) and may run beside other share cells.
+#       Spec-wide SHARE=1 (not FAST) = share lane (job-queue daemon-share). Admission instead of the settle when a sibling runs:
+#       declared-memory ledger <= MemTotal - KLT_IDLE_MARGIN_GB - SHARE_MARGIN_GB, MemAvailable - margin >= MEM_GB, GTT used + MEM_GB
+#       <= SHARE_GTT_PCT %, one model-loading cell at a time, no join while an exclusive waiter is blocked. check refuses SHARE on
+#       bench, tbo/hazard 'perf', HOLD_LOCK=1; run cells declare SHARE_LOAD=0|1; a model-loading share cell declares MEM_GB.
+#       SHARE_PRIO=backfill (default): a share-lane cell starts only while no normal / fast job runs or waits (or the lock is
+#       already shared); after SHARE_BACKFILL_MAX s it alternates. SHARE_PRIO=alternate skips the backfill wait.
+#   YIELD_PREEMPT=1 (spec, or KLT_YIELD_PREEMPT): a queued HOLD_LOCK block stops at its next cell boundary when the yield file
+#       exists, writes "PREEMPTED" to RESULTS, requeues its spec under the same id and exits 75 (no EXITED line).
+#   check (also run by job-queue submit): executables exist unless an earlier build / cmake cell makes them; -m/-md/-f/--mmproj/
+#       --kl-divergence-base and absolute path args exist unless under OUT or made earlier (warn); build dirs share one glslc.
+#
+# Defaults: MEM_GB = $KLT_MEM_GB, else half of MemTotal. MESA = release when $KLT_VK_ICD is set, else system; MESA=release
+#   = the ICD json in $KLT_VK_ICD (refused when unset). ICD cells get LD_LIBRARY_PATH = <binary dir>[:$KLT_VK_LIBPATH].
+# Machine knobs (env; set them once, e.g. in the service unit):
+#   KLT_IDLE_MARGIN_GB=6      MemTotal - MemAvailable on an idle machine (read /proc/meminfo when nothing runs)
+#   KLT_MEM_KILL_MIB=4096     kill a cell when MemAvailable falls below this (protects the desktop / OOM killer)
+#   KLT_VRAM_KILL_MIB=0       kill a cell when VRAM used exceeds this (APUs with a small carve-out: ~90% of it; 0 = off).
+#                             Such machines usually also want `export GGML_VK_PREFER_HOST_MEMORY=1` in the spec.
+#   KLT_SETTLE_GTT_GB=2       GTT in use must drop to this before a GPU cell starts
+#   KLT_COOL_TCTL=60 KLT_COOL_EDGE=50 KLT_COOL_S=600   cooldown before each GPU cell (CPU Tctl, GPU edge, max wait)
+#   KLT_SHARE_MARGIN_GB=6 KLT_SHARE_GTT_PCT=50   share-lane admission margins; KLT_JOBS = build parallelism (default nproc)
+#   KLT_GLSLC                 expected glslc path; build dirs configured with another one get a WARN
+#   KLT_YIELD_FILE            default $KLT_HOME/YIELD: while it exists no new cell starts (a running cell finishes)
+#   KLT_GPU_COMM              regex of process names that count as foreign GPU work (cell marked DIRTY)
+# Per GPU cell: STOP-file check, yield file, flock + owner line (released between cells unless HOLD_LOCK=1), cooldown, ttm-drain,
+# settle (GTT and MemAvailable) then SETTLE_S, setsid + timeout, 2 s sampler (gtt vram memavail sclk edge tctl W busy), foreign GPU
+# process watch, memory / VRAM kill, kernel + output device-error scan. A device error writes $KLT_STOP and ends the job (rc 70):
+# nothing runs until a human reads and removes it. GPU cells call samplers/ttm-drain.sh only with KLT_TTM_DRAIN=1 (it uses sudo -n).
+# Progress file $KLT_HOME/progress (pid label hold k N cell start timeout remaining-timeouts avg-done-s) for an ETA.
+# Records: OUT/RESULTS.txt (one line per cell, "<LABEL>-DONE" or "<LABEL>: EXITED rc=N"), OUT/SUMMARY.txt, OUT/cells/<name>/{meta.txt,
+# stdout.log,stderr.log,samp.tsv}. Exit: 0 all cells rc=0, 1 some cell failed, 2 bad spec, 70 device error / STOP present,
+# 75 preempted and requeued.
+set -u
+. "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
+export KLT_ROOT KLT_HOME KLT_RESULTS KLT_LOCK KLT_STOP KLT_QUEUE KLT_VK_ICD KLT_GPU_CARD
+export RESULTS=$KLT_RESULTS   # short alias for specs: OUT=$RESULTS/<name>
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+MODE=${1:-}; SPEC=${2:-}
+[ "$MODE" = check ] || [ "$MODE" = run ] || { usage; exit 2; }
+[ -r "$SPEC" ] || { echo "job-run: no spec $SPEC" >&2; exit 2; }
+SPEC=$(readlink -f "$SPEC"); TOOLS=$(dirname "$(readlink -f "$0")")
+R=$KLT_RESULTS; LOCK=$KLT_LOCK; STOPF=$KLT_STOP
+ts() { date -u +%FT%TZ; }
+
+# ---- defaults (machine knobs from the environment, spec values win)
+MT=$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo)
+LABEL=""; OUT=""; MEM_GB=${KLT_MEM_GB:-$(( ${MT:-16} / 2 ))}; SETTLE_S=30; TIMEOUT=3600; HOLD_LOCK=0; MESA=""; JOBS=${KLT_JOBS:-$(nproc)}
+VRAM_KILL_MIB=${KLT_VRAM_KILL_MIB:-0}; MEM_KILL_MIB=${KLT_MEM_KILL_MIB:-4096}; IDLE_MARGIN_GB=${KLT_IDLE_MARGIN_GB:-6}
+SETTLE_GTT_GB=${KLT_SETTLE_GTT_GB:-2}; FAST=0; YIELD_MAX=1800; YIELD_PREEMPT=${KLT_YIELD_PREEMPT:-0}
+DRAM_SAMPLE=${DRAM_SAMPLE:-0}; DRAM_PERIOD_MS=${DRAM_PERIOD_MS:-50}
+CHAN_SAMPLE=${CHAN_SAMPLE:-0}; CHAN_PERIOD_MS=${CHAN_PERIOD_MS:-100}
+TRACE=${TRACE:-${KLT_TRACE:-0}}; TRACE_SET=${TRACE_SET:-wake}   # samplers/trace/trace-run around the cell command (needs sudo -n; off unless set)
+QOS_US=${QOS_US:-0}   # jobs/qos-run holds a CPU latency request of QOS_US us around the cell command (0 = off)
+COOL_TCTL=${KLT_COOL_TCTL:-60}; COOL_EDGE=${KLT_COOL_EDGE:-50}; COOL_S=${KLT_COOL_S:-600}   # cooldown before each GPU cell; proceeds after COOL_S
+SHARE=0; SHARE_MARGIN_GB=${KLT_SHARE_MARGIN_GB:-6}; SHARE_GTT_PCT=${KLT_SHARE_GTT_PCT:-50}; SHARE_WAIT_MAX=21600
+SHARE_PRIO=backfill; SHARE_BACKFILL_MAX=7200   # share-lane jobs start a cell only while no normal / fast job runs (or the lock is already shared); after the cap: alternate
+YF=${KLT_YIELD_FILE:-$KLT_HOME/YIELD}
+SPROF=${SUITE_PROFILE:-$KLT_HOME/suite-cache/optimes.json}
+
+# ---- collect
+CELLS=(); CMODEL=(); NAMES=" "; ERR=0
+add() { local kind=$1 name=$2; shift 2
+  [[ $name =~ ^[A-Za-z0-9_.+-]+$ ]] || { echo "spec: bad cell name '$name'"; ERR=1; return; }
+  case "$NAMES" in *" $name "*) echo "spec: duplicate cell name $name"; ERR=1; return;; esac; NAMES+="$name "
+  local s; s=$(printf '%q ' "$kind" "$name" "$@"); CELLS+=("$s"); CMODEL+=("${MODEL:-}"); }
+bench() { add bench "$@"; }; tbo() { add tbo "$@"; }; ppl() { add ppl "$@"; }; run() { add run "$@"; }; cpu() { add cpu "$@"; }
+build() { add build "$@"; }; hazard() { add hazard "$@"; }; repeat() { add repeat "$@"; }; suite() { add suite "$@"; }
+# shellcheck disable=SC1090
+. "$SPEC" || { echo "job-run: sourcing $SPEC failed"; exit 2; }
+OUT=${OUT/#\~/$HOME}
+MEMSET=$(grep -cE '^[[:space:]]*(export[[:space:]]+)?MEM_GB=' "$SPEC")
+LANE=normal; [ "$FAST" = 1 ] && LANE=fast; [ "$SHARE" = 1 ] && [ "$FAST" != 1 ] && LANE=share
+# share helpers used by check and run: does a cell load a model, and the default declared memory of a cell
+shload() { local k=$1 m=$2 x=$3 a; shift 3; [ -n "$x" ] && { echo "$x"; return; }
+  case $k in build|cpu|tbo|hazard|suite) echo 0; return;; ppl) echo 1; return;; esac; [ -n "$m" ] && { echo 1; return; }
+  for a in "$@"; do case $a in -m|--model|-md|--model-draft|-hf|--hf-repo|--model=*|-mm|--mmproj) echo 1; return;; esac
+    case ${a##*/} in llama-server|llama-cli|llama-simple|llama-mtmd-cli) echo 1; return;; esac; done; echo 0; }
+# default declared memory (GB) of a share cell by kind; a cell token MEM_GB=<n> overrides
+# (kind defaults are capped at what an idle machine can admit: MemTotal - KLT_IDLE_MARGIN_GB - SHARE_MARGIN_GB)
+shmem() { [ -n "$3" ] && { echo "$3"; return; }; [ "$1" = 1 ] || { echo "$MEM_GB"; return; }   # share kind ld cellmem
+  local m cap=$(( ${MT:-16} - IDLE_MARGIN_GB - SHARE_MARGIN_GB )); [ $cap -lt 1 ] && cap=1
+  case $2 in build) m=16;; cpu) m=8;; tbo|hazard) m=8;; suite) m=28;; repeat) [ "$4" = 1 ] && m=$MEM_GB || m=8;; *) m=$MEM_GB;; esac
+  [ "$m" -gt "$cap" ] && [ "$m" != "$MEM_GB" ] && m=$cap; echo "$m"; }
+
+# ---- validate
+[[ $LABEL =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "spec: LABEL missing or bad"; ERR=1; }
+case "$OUT" in "$R"/?*) ;; *) echo "spec: OUT must be under KLT_RESULTS=$R (got '$OUT')"; ERR=1;; esac
+[ ${#CELLS[@]} -gt 0 ] || { echo "spec: no cells"; ERR=1; }
+[[ $MEM_GB =~ ^[0-9]+$ ]] || { echo "spec: MEM_GB=$MEM_GB (whole GB)"; ERR=1; MEM_GB=0; }
+[ -z "$MESA" ] && { if [ -n "$KLT_VK_ICD" ]; then MESA=release; else MESA=system; fi; }
+case $MESA in
+  release) ICD=$KLT_VK_ICD; [ -z "$ICD" ] && { echo "spec: MESA=release needs KLT_VK_ICD=<icd json> (the pinned Vulkan driver); set it, or use MESA=system or MESA=<icd json>"; ERR=1; };;
+  system) ICD="";;
+  *) ICD=$MESA;;
+esac
+[ -n "$ICD" ] && [ ! -r "$ICD" ] && { echo "spec: Vulkan ICD $ICD missing"; ERR=1; }
+# per-cell checks: errors name the cell and the path, one line each. "produced" = under OUT or under a dir an earlier build / cmake
+# cell makes (warn, do not fail).
+PROD=(); UNGATED=(); UGW=""; cfgseen=0; NW=0; FASTSUM=0; GLSEEN=""
+QPROD=""; qprod() {   # build dirs of jobs queued ahead (pending / running, both lanes): "dir<TAB>job" lines, computed once
+  [ -n "$QPROD" ] && return; QPROD=" "; local f Q=$KLT_QUEUE
+  local L="$Q/running/*.job $Q/pending/*.job"; [ "$FAST" = 1 ] && L=""   # a FAST job does not wait for the normal lane
+  for f in $L $Q/fast/running/*.job $Q/fast/pending/*.job; do [ -e "$f" ] || continue; [ "$(readlink -f "$f")" = "$SPEC" ] && continue
+    QPROD+=$(bash -c 'p(){ local a n; while [ $# -gt 0 ]; do case $1 in -B|--build) echo "${2%/}";; -B?*) echo "${1#-B}";; esac; shift; done; }
+      build(){ shift; [[ ${1:-} == GATE=* ]] && shift; echo "${1%/}"; }; cpu(){ shift; p "$@"; for a in "$@"; do grep -oE "(-B ?|--build )[^ ;&|$]+" <<<"$a" | sed -E "s/^(-B ?|--build )//"; done; }
+      bench(){ :; }; tbo(){ :; }; ppl(){ :; }; run(){ :; }; hazard(){ :; }; repeat(){ :; }; suite(){ :; }; . "$1" 2>/dev/null' _ "$f" 2>/dev/null | sed "s|\$|\t$(basename "$f" .job)|")$'\n'; done; }
+qmade() { local x; qprod; while IFS=$'\t' read -r x j; do [ -n "$x" ] && [[ $1 == "$x"/* ]] && { echo "$j"; return 0; }; done <<<"$QPROD"; return 1; }
+under() { local p=$1 x; [[ $p == "$OUT" || $p == "$OUT"/* ]] && return 0; for x in "${PROD[@]}"; do [[ $p == "$x" || $p == "$x"/* ]] && return 0; done; return 1; }
+warn() { echo "$1"; NW=$((NW+1)); }
+i=-1
+for c in "${CELLS[@]}"; do eval "set -- $c"; kind=$1; name=$2; shift 2; i=$((i+1)); cmod=${CMODEL[$i]:-}
+  if [ "$kind" = build ]; then bg=0; btmo=$TIMEOUT; csh=$SHARE
+    while [[ ${1:-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do case $1 in GATE=1) bg=1;; GATE=*) ;; TIMEOUT=*) btmo=${1#TIMEOUT=};; SHARE=*) csh=${1#SHARE=};; MEM_GB=*) ;; *) echo "cell $name: build takes only GATE= / TIMEOUT= / SHARE= / MEM_GB= tokens (got $1)"; ERR=1;; esac; shift; done
+    [ "$LANE" = share ] && [ "$csh" != 1 ] && { echo "cell $name: SHARE=0 cell in a share-lane spec (spec-wide SHARE=1): put exclusive cells in a normal job"; ERR=1; }
+    [ "$csh" = 1 ] && [ "$HOLD_LOCK" = 1 ] && { echo "cell $name: SHARE=1 with HOLD_LOCK=1 (a held block is exclusive)"; ERR=1; }
+    [ $bg = 0 ] && UNGATED+=("$name ${1%/}")
+    # a build dir an earlier cpu cell configures (cmake -B): only warn
+    if [ ! -f "${1:-}/CMakeCache.txt" ]; then
+      if [ "$cfgseen" = 1 ]; then echo "cell $name: WARN ${1:-?} not configured yet (ok if an earlier cpu cell configures it)"
+      else echo "cell $name: ${1:-?} is not a cmake build dir"; ERR=1; fi
+    fi
+    # shader numerics depend on the glslc a Vulkan build was configured with: every arm must use the same one
+    if [ -f "${1:-}/CMakeCache.txt" ]; then gl=$(sed -n 's/^Vulkan_GLSLC_EXECUTABLE:[A-Za-z]*=//p' "$1/CMakeCache.txt" | head -1)
+      if [ -n "$gl" ]; then
+        [ -n "${KLT_GLSLC:-}" ] && [ "$gl" != "$KLT_GLSLC" ] && echo "cell $name: WARN ${1%/} was configured with glslc $gl, not KLT_GLSLC=$KLT_GLSLC: shader numerics can differ; reconfigure with -DVulkan_GLSLC_EXECUTABLE=$KLT_GLSLC"
+        [ -n "$GLSEEN" ] && [ "$gl" != "${GLSEEN#*|}" ] && echo "cell $name: WARN ${1%/} uses glslc $gl but ${GLSEEN%%|*} uses ${GLSEEN#*|}: arms built with different glslc are not comparable"
+        [ -z "$GLSEEN" ] && GLSEEN="${1%/}|$gl"
+      fi; fi
+    [ -n "${1:-}" ] && PROD+=("${1%/}"); FASTSUM=$((FASTSUM+btmo)); continue; fi
+  nock=""; tmo=$TIMEOUT; csh=$SHARE; xld=""; cmg=""; cq=$QOS_US
+  [ "$kind" = suite ] && [ "$HOLD_LOCK" != 1 ] && csh=1   # suite = non-timing: shares the lock unless SHARE=0
+  while [[ ${1:-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do case $1 in NOCHECK=*) nock=",${1#NOCHECK=},";; MODEL=*) cmod=${1#MODEL=};; TIMEOUT=*) tmo=${1#TIMEOUT=};;
+    SUITE_SHARDS=*) [[ ${1#*=} =~ ^([1-9][0-9]*|auto)$ ]] || { echo "cell $name: bad SUITE_SHARDS=${1#*=} (n or auto)"; ERR=1; };;
+    CACHE=*) [[ ${1#*=} =~ ^(auto|master|force|off)$ ]] || { echo "cell $name: bad CACHE=${1#*=} (auto|master|force|off)"; ERR=1; };;
+    SHARE=*) csh=${1#SHARE=};; SHARE_LOAD=*) xld=${1#SHARE_LOAD=};; MEM_GB=*) cmg=${1#MEM_GB=};;
+    N=*) [ "$kind" = hazard ] && ! [[ ${1#N=} =~ ^[1-9][0-9]*$ ]] && { echo "cell $name: bad N=${1#N=}"; ERR=1; };;
+    QOS_US=*) cq=${1#QOS_US=};;
+    TRACE=*) [[ ${1#*=} =~ ^([01]|auto)$ ]] || { echo "cell $name: bad TRACE=${1#*=} (0|1|auto)"; ERR=1; };;
+    TRACE_SET=*) [[ ${1#*=} =~ ^(base|freq|wake|io|wq|sched|all)$ ]] || { echo "cell $name: bad TRACE_SET=${1#*=} (base freq wake io wq sched all)"; ERR=1; };; esac; shift; done
+  FASTSUM=$((FASTSUM+tmo))
+  if [ "$kind" != cpu ] && [ "$cq" != 0 ]; then
+    { [[ $cq =~ ^[1-9][0-9]*$ ]] && [ "$cq" -le 100000 ]; } || { echo "cell $name: bad QOS_US=$cq (us, 1..100000; 0 = off)"; ERR=1; }
+    { [ -w /dev/cpu_dma_latency ] && [ -x "$TOOLS/qoshold" ]; } || { echo "cell $name: QOS_US needs write access to /dev/cpu_dma_latency and a built jobs/qoshold (gcc -O2 -o qoshold qoshold.c)"; ERR=1; }; fi
+  b=${1:-}; [ -z "$b" ] && { echo "cell $name: no command"; ERR=1; continue; }
+  all=" $* "
+  # cpu cells that configure / build: what they make counts as produced for later cells
+  if [ "$kind" = cpu ]; then [[ $all == *cmake* ]] && cfgseen=1
+    for ((j=1; j<=$#; j++)); do a=${!j}; n=$((j+1)); case $a in -B|--build) [ $n -le $# ] && PROD+=("${!n%/}");; -B?*) PROD+=("${a#-B}");; esac; done
+    while read -r p; do [ -n "$p" ] && PROD+=("${p%/}"); done < <(grep -oE '(-B ?|--build )[^ ;&|$]+' <<<"$all" | sed -E 's/^(-B ?|--build )//')
+  fi
+  # the real executable behind env / nice / timeout / setsid / stdbuf / taskset wrappers
+  j=1; while :; do x=${!j:-}; case $(basename -- "$x") in
+      env) j=$((j+1)); while [[ ${!j:-} =~ ^(-.*|[A-Za-z_][A-Za-z0-9_]*=.*)$ ]]; do j=$((j+1)); done;;
+      nice) j=$((j+1)); [[ ${!j:-} == -n ]] && j=$((j+2)); [[ ${!j:-} =~ ^-[0-9]+$ ]] && j=$((j+1));;
+      timeout) j=$((j+1)); while [[ ${!j:-} == -* ]]; do case ${!j} in -s|-k) j=$((j+2));; *) j=$((j+1));; esac; done; j=$((j+1));;
+      setsid|stdbuf|taskset|numactl) j=$((j+1)); while [[ ${!j:-} == -* ]]; do j=$((j+1)); done; [ "$x" = taskset ] && j=$((j+1));;
+      *) break;; esac; done
+  rb=${!j:-$b}; rbj=$j
+  if [[ $nock != *,bin,* ]] && ! command -v "$rb" >/dev/null 2>&1 && [ ! -x "$rb" ]; then
+    if under "$rb"; then echo "cell $name: WARN $rb not built yet (an earlier build cell / OUT makes it)"
+    elif [ -e "$rb" ]; then echo "cell $name: $rb is not executable"; ERR=1
+    elif qj=$(qmade "$rb"); then echo "cell $name: WARN $rb not built yet; queued job $qj builds it (ok while that job runs first)"
+    else echo "cell $name: $rb missing (no such command; no earlier build cell makes it$([ "$FAST" = 1 ] && echo "; a FAST job runs ahead of normal-lane jobs, so their builds do not count"))"; ERR=1; fi; fi
+  for x in "${UNGATED[@]}"; do [[ $UGW == *"|$x|"* ]] && continue; [[ $rb == "${x#* }"/* ]] && { UGW+="|$x|"
+    echo "cell $name: WARN uses ${rb#${x#* }/} from build cell ${x%% *}, which is not GATE=1: if that build fails, this and later cells run rc=127 or on a stale binary"; }; done
+  [ "$kind" = hazard ] && [[ $(basename -- "$rb") != test-backend-ops* ]] && echo "cell $name: WARN hazard runs $(basename -- "$rb"), expected test-backend-ops"
+  if [ "$kind" = suite ]; then [[ $(basename -- "$rb") == test-backend-ops* ]] || { echo "cell $name: suite runs $(basename -- "$rb"), expected test-backend-ops"; ERR=1; }
+    for a in "$@"; do case $a in perf|grad|support|census) echo "cell $name: suite is test mode only (got '$a'; use tbo)"; ERR=1;; -o|-p|-j|--test-file) echo "cell $name: WARN suite with $a runs unsharded (use tbo for filtered runs)";; esac; done;
+    [ ! -r "$SPROF" ] && echo "cell $name: WARN no suite op profile yet ($SPROF): this run shards by op count (unbalanced, slower) and records one; allow for it in TIMEOUT=${tmo}s"; fi
+  # share cells: non-timing only; model loads declare memory
+  [[ $csh =~ ^[01]$ ]] || { echo "cell $name: SHARE=$csh (0 or 1)"; ERR=1; }
+  [[ -z $xld || $xld =~ ^[01]$ ]] || { echo "cell $name: SHARE_LOAD=$xld (0 or 1)"; ERR=1; }
+  [[ -z $cmg || $cmg =~ ^[0-9]+$ ]] || { echo "cell $name: MEM_GB=$cmg (whole GB)"; ERR=1; }
+  [[ $cmg =~ ^[0-9]+$ ]] && [ -n "$MT" ] && [ "$cmg" -gt $((MT - IDLE_MARGIN_GB)) ] && warn "cell $name: WARN MEM_GB=$cmg but this machine settles to about $((MT - IDLE_MARGIN_GB))G MemAvailable at best: this cell would SETTLE-TIMEOUT"
+  [[ $SHARE_PRIO == backfill || $SHARE_PRIO == alternate ]] || { echo "spec: SHARE_PRIO=$SHARE_PRIO (backfill or alternate)"; ERR=1; }
+  [ "$LANE" = share ] && [ "$csh" != 1 ] && { echo "cell $name: SHARE=0 cell in a share-lane spec (spec-wide SHARE=1): put exclusive cells in a normal job"; ERR=1; }
+  if [ "$csh" = 1 ]; then
+    [ "$kind" = bench ] && { echo "cell $name: SHARE=1 on a bench cell (timing cells never share)"; ERR=1; }
+    [ "$(basename -- "$rb")" = llama-bench ] && [ "$kind" != bench ] && { echo "cell $name: SHARE=1 runs llama-bench (timing never shares)"; ERR=1; }
+    [ "$HOLD_LOCK" = 1 ] && { echo "cell $name: SHARE=1 with HOLD_LOCK=1 (a held block is exclusive)"; ERR=1; }
+    case $kind in tbo|hazard) for a in "$@"; do [[ $a == perf || $a == *=perf ]] && { echo "cell $name: SHARE=1 on a test-backend-ops perf run (timing)"; ERR=1; break; }; done;; esac
+    [ "$kind" = run ] && [ -z "$xld" ] && { echo "cell $name: SHARE=1 run cell must declare SHARE_LOAD=0|1 (does it load a model?)"; ERR=1; }
+    sld=$(shload "$kind" "$cmod" "$xld" "$@")
+    [ "$sld" = 1 ] && [ -z "$cmg" ] && [ "$MEMSET" = 0 ] && { echo "cell $name: SHARE=1 model-loading cell needs a declared MEM_GB (cell token MEM_GB=<n> or spec-wide)"; ERR=1; }
+  fi
+  # path arguments
+  if [[ $nock != *,path,* ]]; then
+    kldw=0; [[ $all == *" --kl-divergence-base "* && $all != *" --kl-divergence "* ]] && kldw=1
+    for ((j=1; j<=$#; j++)); do [ $j = $rbj ] && continue; a=${!j}; n=$((j+1)); v=""; strict=""
+      case $a in
+        -m|--model|-md|--model-draft|-mm|--mmproj|-f|--file|--kl-divergence-base) v=${!n:-}; strict=$a; j=$n;;
+        --model=*|--file=*|--mmproj=*|--kl-divergence-base=*) v=${a#*=}; strict=${a%%=*};;
+        /*) [[ $a == *" "* ]] || v=$a;;
+        -*=/*) v=${a#*=};;
+      esac
+      [ -z "$v" ] && continue; v=${v/#\~/$HOME}; [ -e "$v" ] && continue
+      case $v in /dev/*|/proc/*|/sys/*) continue;; esac
+      if [ "$strict" = --kl-divergence-base ] && [ $kldw = 1 ]; then PROD+=("$v"); continue; fi   # this cell writes the logits base
+      if [ -n "$strict" ]; then
+        if [[ $v != /* ]]; then echo "cell $name: WARN $strict $v is relative (not checked)"
+        elif under "$v"; then echo "cell $name: WARN $strict $v not there yet (under OUT / an earlier cell's dir)"
+        else echo "cell $name: $strict $v missing"; ERR=1; fi
+      elif under "$v"; then :
+      elif [ -d "$(dirname -- "$v")" ]; then echo "cell $name: WARN $v does not exist (ok if this cell creates it)"
+      elif under "$(dirname -- "$v")"; then :
+      else echo "cell $name: $v missing (and so is its directory)"; ERR=1; fi
+    done
+  fi
+done
+# an idle machine settles at about MemTotal - KLT_IDLE_MARGIN_GB MemAvailable
+[ -n "$MT" ] && [ "$MEM_GB" -gt $((MT - IDLE_MARGIN_GB)) ] && warn "spec: WARN MEM_GB=$MEM_GB but this machine (MemTotal ${MT}G) settles to about $((MT - IDLE_MARGIN_GB))G MemAvailable at best (KLT_IDLE_MARGIN_GB=$IDLE_MARGIN_GB): every GPU cell would SETTLE-TIMEOUT"
+if [ "$FAST" = 1 ]; then
+  [ $HOLD_LOCK = 1 ] && { echo "spec: FAST=1 with HOLD_LOCK=1 (a fast job never holds the lock across cells)"; ERR=1; }
+  [ $FASTSUM -gt 1200 ] && { echo "spec: FAST=1 but the cell timeouts sum to ${FASTSUM}s > 1200 (set TIMEOUT= per cell or spec-wide)"; ERR=1; }
+fi
+for c in "${CELLS[@]}"; do eval "set -- $c"; printf '  %-6s %-24s %s\n' "$1" "$2" "$(shift 2; echo "$*" | cut -c1-150)"; done
+echo "job-run: label=$LABEL cells=${#CELLS[@]} out=$OUT mem_gb=$MEM_GB timeout=${TIMEOUT}s hold_lock=$HOLD_LOCK icd=${ICD:-system}$([ "$FAST" = 1 ] && echo " FAST (cell timeouts ${FASTSUM}s)")$([ "$LANE" = share ] && echo " SHARE-lane")"
+[ $ERR = 0 ] || { echo "job-run: spec REFUSED"; exit 2; }
+[ "$MODE" = check ] && { echo "job-run: check ok"; exit 0; }
+
+# ---- run
+[ -e "$STOPF" ] && { echo "job-run: STOP file $STOPF present, refusing: $(cat "$STOPF")"; exit 70; }
+GPU=$(klt_gpu_card 2>/dev/null)
+[ -n "$GPU" ] && [ -r "$GPU/mem_info_gtt_used" ] || { echo "job-run: no amdgpu memory counters (set KLT_GPU_CARD=/sys/class/drm/cardN/device)"; exit 70; }
+mkdir -p "$OUT/cells"; RES=$OUT/RESULTS.txt; cp "$SPEC" "$OUT/spec.job"
+say() { echo "$(ts) $*" >> "$RES"; echo "$(ts) $*"; }
+hw() { for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name 2>/dev/null)" = "$1" ] && { echo $h; return; }; done; }
+HA=$(ls -d "$GPU"/hwmon/hwmon* 2>/dev/null | head -1); [ -n "$HA" ] || HA=$(hw amdgpu)
+HK=$(hw k10temp); [ -n "$HK" ] || HK=$(hw zenpower); [ -n "$HK" ] || HK=$(hw coretemp)   # CPU package temperature
+tcpu() { echo $(( $(cat "$HK/temp1_input" 2>/dev/null || echo 0) / 1000 )); }
+tgpu() { echo $(( $(cat "$HA/temp1_input" 2>/dev/null || echo 0) / 1000 )); }
+DEVERR='DeviceLost|ErrorDeviceLost|Not enough memory for command submission|BO_VA|ring .* timeout|GPU reset|device wedged'
+GPUCOMM=${KLT_GPU_COMM:-'^(llama-bench|llama-server|llama-perplexit|llama-cli|test-backend-op|llama-batched-b|llama-mtmd-cli)$'}
+HELD=0; CP=""; FASTW=$KLT_HOME/fastwant; NORMW=$KLT_HOME/normalwant; YLD=""; PROG=$KLT_HOME/progress; CYLD=""
+TTMD=$KLT_ROOT/samplers/ttm-drain.sh; [ "${KLT_TTM_DRAIN:-0}" = 1 ] || TTMD=/nonexistent   # opt-in: ttm-drain uses sudo -n
+# fast lane: a FAST job announces itself in $FASTW ("pid label") for its whole run; a normal job yields before taking the lock for a
+# cell while that pid lives, up to YIELD_MAX s per wait (a stuck fast job cannot stall the queue). Inside a HOLD_LOCK block HELD=1,
+# so nothing yields and the fast job waits on the flock until the block ends.
+YTOT=0   # fast-lane yield budget used since the last boundary with no fast job (counts across consecutive fast jobs)
+fast_yield() { YLD=""; [ "$FAST" = 1 ] && return; local t0 w o tgt n FQ=$KLT_QUEUE/fast
+  # at most ONE fast job per cell boundary: the running one, else the next pending one (the fast daemon is FIFO). Fast jobs that
+  # arrive later wait for a later boundary. Budget YIELD_MAX s across consecutive yields; when spent, no more yielding (and a fast
+  # job defers its next cell to us via $NORMW) until a boundary finds the fast lane empty, so a stream of fast jobs cannot starve us.
+  o=$(cat "$FASTW" 2>/dev/null); [ -n "$o" ] && kill -0 "${o%% *}" 2>/dev/null || o=""
+  tgt=$(ls "$FQ"/running/*.job 2>/dev/null | head -1); [ -z "$tgt" ] && tgt=$(ls "$FQ"/pending/*.job 2>/dev/null | sort | head -1)
+  tgt=${tgt##*/}
+  [ -z "$o$tgt" ] && { YTOT=0; return 0; }
+  if [ "$YTOT" -ge "$YIELD_MAX" ]; then YLD="no yield: fast budget ${YTOT}s/${YIELD_MAX}s spent"; echo "$$ $LABEL -" > "$NORMW"; return 0; fi
+  n=${tgt%.job}; n=${n#*Z-}; [ -z "$n" ] && n=${o#* }
+  t0=$(date +%s); echo "$(ts) yielding the lock to fast-lane job $n (budget used ${YTOT}s/${YIELD_MAX}s)"
+  echo "$$ $LABEL ${tgt:--}" > "$NORMW"   # only $tgt may pass; any other fast job defers until we hold the lock
+  while :; do
+    if [ -n "$tgt" ]; then [ -e "$FQ/running/$tgt" ] || [ -e "$FQ/pending/$tgt" ] || break
+    else kill -0 "${o%% *}" 2>/dev/null || break; fi
+    w=$(( $(date +%s) - t0 ))
+    [ $((YTOT + w)) -ge "$YIELD_MAX" ] && { YTOT=$((YTOT + w)); YLD="yield-cap ${w}s to fast $n (budget ${YTOT}s/${YIELD_MAX}s spent)"; echo "$$ $LABEL -" > "$NORMW"; return 0; }
+    sleep 2; done
+  w=$(( $(date +%s) - t0 )); YTOT=$((YTOT + w))
+  echo "$$ $LABEL -" > "$NORMW"   # our turn now: a fast job started since defers its next cell to us
+  YLD="yielded ${w}s to fast $n (budget ${YTOT}s/${YIELD_MAX}s)"; return 0; }
+fast_defer() { [ "$FAST" = 1 ] || return 0; local o i me=${SPEC##*/}   # $NORMW = "pid label target": a normal job's turn; only target passes
+  for i in $(seq 60); do o=$(cat "$NORMW" 2>/dev/null) && [ -n "$o" ] && kill -0 "${o%% *}" 2>/dev/null || return 0
+    [ "${o##* }" = "$me" ] && return 0
+    [ $i = 1 ] && echo "$(ts) fast job defers to normal job's turn: $o"; sleep 2; done; }
+# ---- yield file: while $YF exists no new cell starts (exclusive or shared); a running cell finishes
+yield_live() { [ -e "$YF" ]; }
+yield_pre() { [ "$HOLD_LOCK" = 1 ] && [ "$YIELD_PREEMPT" = 1 ] && [[ $SPEC == "$KLT_QUEUE"/running/*.job ]]; }   # held block may be preempted
+yield_wait() { local t0 w; yield_live || return 0; t0=$(date +%s)
+  echo "$(ts) yielding: $YF exists ($(head -c 120 "$YF" 2>/dev/null | tr '\n' ' '))"; progress_write wait-yield
+  while yield_live; do [ -e "$STOPF" ] && break; sleep 3; done
+  w=$(( $(date +%s) - t0 )); CYW=$((CYW + w)); CYLD="yield-file ${CYW}s"; echo "$(ts) yield file gone after ${w}s"; }
+lock_take() { [ $HELD = 1 ] && return; CYLD=""; CYW=0
+  while :; do yield_wait; [ -e "$STOPF" ] && { say "STOP file present: $(cat "$STOPF")"; exit 70; }
+    fast_yield; fast_defer; exec 9>>"$LOCK"; flock -n 9 || { echo "$(ts) waiting for lock: $(cat $LOCK.owner 2>/dev/null)"; flock 9; }
+    yield_live || break; exec 9>&-; echo "$(ts) yield file appeared while we waited for the lock: releasing it"; done
+  [ "$FAST" = 1 ] || { grep -q "^$$ " "$NORMW" 2>/dev/null && rm -f "$NORMW"; }
+  echo "pid=$$ label=$LABEL-$1 started=$(date -Is)" > "$LOCK.owner"; HELD=1; }
+lock_drop() { [ $HELD = 2 ] && { share_drop; return; }; [ $HELD = 1 ] || return; grep -q "pid=$$ " "$LOCK.owner" 2>/dev/null && : > "$LOCK.owner"; exec 9>&-; HELD=0; }
+progress_write() {   # $1 = cell name (or a state word); hold field: 0/1, 2 = held + preemptible
+  echo "$$ $LABEL $( yield_pre && echo 2 || echo $HOLD_LOCK) $((ci+1)) ${#CELLS[@]} $1 $(date +%s) ${tmo:-$TIMEOUT} $(rem_tmo) $([ $CDN -gt 0 ] && echo $((CDS / CDN)) || echo -)" > "$PROG.$$" && mv -f "$PROG.$$" "$PROG"; }
+rem_tmo() { local i s=0; for ((i=ci+1; i<${#CTMO[@]}; i++)); do s=$((s + CTMO[i])); done; echo $s; }
+cleanup() { [ -n "$CP" ] && kill -TERM -- -"$CP" 2>/dev/null; grep -q "^$$ " "$PROG" 2>/dev/null && rm -f "$PROG"; HELD=1; [ -e "$SHD/$$" ] && HELD=2; lock_drop; grep -q "^$$ " "$NORMW" 2>/dev/null && rm -f "$NORMW"
+  [ "$FAST" = 1 ] && grep -q "^$$ " "$FASTW" 2>/dev/null && rm -f "$FASTW"; }
+trap 'rc=$?; cleanup; [ $rc != 0 ] && say "$LABEL: EXITED rc=$rc"; exit $rc' EXIT
+trap 'exit 143' TERM INT
+
+# foreign GPU-process watch: a matched process only marks the cell DIRTY if it holds a GPU node (/dev/dri/renderD*, /dev/dri/card*,
+# /dev/kfd) or cannot be inspected (vanished / not ours); a CPU-only one becomes a "foreign-note" line in meta.txt. Each pid gets one
+# meta.txt line with argv, cwd and ppid chain; re-checked every poll.
+fclass() { local p=$1 x n=""   # -> holds:<nodes> | cpu | gone
+  ls /proc/$p/fd >/dev/null 2>&1 || { echo gone; return; }
+  for x in /proc/$p/fd/*; do x=$(readlink "$x" 2>/dev/null) || continue; case $x in /dev/dri/renderD*|/dev/dri/card*|/dev/kfd) n+="${x#/dev/},";; esac; done
+  [ -n "$n" ] && echo "holds:${n%,}" || echo cpu; }
+finfo() { local p=$1 q=$1 ch="" i pp
+  for i in 1 2 3 4 5 6 7 8; do pp=$(ps -o ppid= -p $q 2>/dev/null | tr -d ' '); [ -z "$pp" ] && break; ch+="$q($(ps -o comm= -p $q 2>/dev/null))<"; [ "$pp" -le 1 ] && break; q=$pp; done
+  echo "pid=$p argv=[$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-300)] cwd=$(readlink /proc/$p/cwd 2>/dev/null || echo '?') ppids=${ch%<}"; }
+fwatch() { local p c k   # $1 = cell dir; updates foreign / fnote
+  for p in $(ps -eo pid=,pgid=,comm= | awk -v g=$CP -v re="$GPUCOMM" '$2!=g && $3~re {print $1}'); do
+    case " $FDIRTY $FSIB " in *" $p "*) continue;; esac
+    c=$(ps -o comm= -p $p 2>/dev/null)
+    if [ $HELD = 2 ] && shsib $p; then FSIB+="$p "; echo "share-sibling: comm=${c:-?} $(finfo $p)" >> $1/meta.txt; continue; fi
+    k=$(fclass $p)
+    case $k in
+      cpu) case " $FNOTE " in *" $p "*) ;; *) FNOTE+="$p "; fnote+="${c:-?}($p) "; echo "foreign-note: cpu-only (no GPU node) $(finfo $p)" >> $1/meta.txt;; esac;;
+      *) FDIRTY+="$p "; foreign+="${c:-?}($p) "; echo "foreign-dirty: $k comm=${c:-?} $(finfo $p)" >> $1/meta.txt;;
+    esac; done; }
+
+# ---- share lane. Registry $SHD/<job-run pid> = "pid label mem load cp started_epoch", written by its owner only (temp + mv);
+# join / leave and the owner-line rewrite happen under the $SHM mutex. HELD=2 = this cell holds the lock shared.
+SHD=$KLT_HOME/share.d; SHM=$KLT_HOME/share.lock; SHGATE=""; SHSEEN=" "; SHT=0; FSIB=" "
+bfblock() { local f p Q=$KLT_QUEUE   # echo a reason (rc 0) while a share-lane cell must leave the GPU to the normal / fast lane
+  [ "$LANE" = share ] && [ "$SHARE_PRIO" = backfill ] || return 1; [ -n "$(shread)" ] && return 1
+  for f in $Q/running/*.job $Q/fast/running/*.job; do [ -e "$f" ] || continue; p=$(cat "${f%.job}.pid" 2>/dev/null)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && { echo "backfill: ${f##*/} runs in the $([[ $f == */fast/* ]] && echo fast || echo normal) lane"; return 0; }; done
+  for f in $Q/pending/*.job $Q/fast/pending/*.job; do [ -e "$f" ] && [ ! -e "${STOPF}" ] && { echo "backfill: ${f##*/} pending in the $([[ $f == */fast/* ]] && echo fast || echo normal) lane"; return 0; }; done; return 1; }
+xwaiting() { local i; i=$(stat -c %i "$LOCK" 2>/dev/null); [ -n "$i" ] && grep -qE "^[0-9]+: +-> FLOCK +ADVISORY +WRITE +[0-9]+ +[0-9a-f]+:[0-9a-f]+:$i " /proc/locks; }
+shlive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null && grep -qa job-run /proc/$1/cmdline 2>/dev/null; }
+shread() { local f p; for f in "$SHD"/*; do [ -e "$f" ] || continue; p=${f##*/}; [ "$p" = $$ ] && continue   # live siblings; prunes dead
+    if shlive "$p"; then cat "$f" 2>/dev/null; else rm -f "$f"; fi; done; }
+shwrite() { echo "$$ $LABEL-$1 $2 $3 $4 $SHT" > "$SHD/.$$" && mv -f "$SHD/.$$" "$SHD/$$"; }   # name mem load cp
+showner() { local all n o; all=$( { cat "$SHD/$$" 2>/dev/null; shread; } | grep . | sort -k6,6n); n=$(grep -c . <<<"$all")
+  if [ "$n" = 0 ]; then grep -q ' shared=' "$LOCK.owner" 2>/dev/null && : > "$LOCK.owner"; return 0; fi
+  o=$(tail -n +2 <<<"$all" | awk '{printf "%s%s", (NR>1?",":""), $2}')
+  echo "$all" | head -1 | { read -r p l m d c t; echo "pid=$p label=$l started=$(date -Is -d @$t) shared=$n${o:+ also=$o}" > "$LOCK.owner"; }; }
+shsib() { local q=$1 i pp; for i in 1 2 3 4 5 6 7 8 9 10; do [ "$q" != $$ ] && [ -e "$SHD/$q" ] && return 0
+    pp=$(ps -o ppid= -p $q 2>/dev/null | tr -d ' '); { [ -z "$pp" ] || [ "$pp" -le 1 ]; } && return 1; q=$pp; done; return 1; }
+shsee() { local l; for l in $(shread | awk '{print $2}'); do case "$SHSEEN" in *" $l "*) ;; *) SHSEEN+="$l ";; esac; done; }
+share_take() {   # name kind mem load -> 0 admitted (HELD=2, SHGATE), 1 skipped (SHGATE), 2 STOP file
+  local name=$1 kind=$2 mem=$3 ld=$4 t0 sib sum nl ns ma g gt why last="" hs=0 bfn="" cyt=""; CYLD=""
+  SHGATE=""; SHSEEN=" "; t0=$(date +%s); mkdir -p "$SHD"; exec 9>>"$LOCK"
+  while :; do
+    [ -e "$STOPF" ] && { exec 9>&-; return 2; }
+    [ $(( $(date +%s) - t0 )) -ge "$SHARE_WAIT_MAX" ] && { exec 9>&-; SHGATE="share SKIP: not admitted in ${SHARE_WAIT_MAX}s (${why:-?})"; return 1; }
+    if [ $hs = 0 ] && [ -z "$bfn" ] && why=$(bfblock); then
+      if [ $(( $(date +%s) - t0 )) -lt "$SHARE_BACKFILL_MAX" ]; then [ "$last" != "$why" ] && { echo "$(ts) share $name: waiting, $why"; last=$why; }; sleep 10; continue; fi
+      bfn=" backfill-cap ${SHARE_BACKFILL_MAX}s: alternating"; echo "$(ts) share $name:$bfn"; fi
+    if [ $hs = 0 ]; then   # hs=1: we kept -s while a sibling settles (it holds -s anyway), so no re-check / re-take
+      if yield_live; then why="yielding: $YF exists"; [ "$last" != "$why" ] && { echo "$(ts) share $name: waiting, $why"; last=$why; }
+        [ -z "$cyt" ] && cyt=$(date +%s); sleep 5; continue; fi
+      [ -n "$cyt" ] && { CYLD="yield-file $(( $(date +%s) - cyt ))s"; cyt=""; }
+      if xwaiting; then why="exclusive waiter blocked on the lock"; [ "$last" != "$why" ] && { echo "$(ts) share $name: not joining: $why"; last=$why; }; sleep 5; continue; fi
+      flock -n -s 9 || { echo "$(ts) share $name: waiting for lock (shared): $(cat $LOCK.owner 2>/dev/null)"; flock -s 9; }; hs=1; fi
+    exec 7>>"$SHM"; flock 7; sib=$(shread)
+    if [ -z "$sib" ]; then SHT=$(date +%s); shwrite "$name" "$mem" "$ld" -; showner; exec 7>&-; HELD=2
+      SHGATE="share first-in mem=${mem}G load=$ld$([ $(( SHT - t0 )) -gt 0 ] && echo " waited $(( SHT - t0 ))s")$bfn"; return 0; fi
+    sum=$(awk '{s+=$3} END{print s+0}' <<<"$sib"); nl=$(awk '$4==1{n++} END{print n+0}' <<<"$sib"); ns=$(awk '$5=="-"{n++} END{print n+0}' <<<"$sib")
+    ma=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo); g=$(( $(cat $GPU/mem_info_gtt_used) >> 30 )); gt=$(( $(cat $GPU/mem_info_gtt_total) >> 30 ))
+    why=""
+    [ "$ns" -gt 0 ] && why="sibling still settling"
+    [ -z "$why" ] && [ $((sum + mem)) -gt $((MT - IDLE_MARGIN_GB - SHARE_MARGIN_GB)) ] && why="ledger ${sum}+${mem}G > $((MT - IDLE_MARGIN_GB - SHARE_MARGIN_GB))G"
+    [ -z "$why" ] && [ $((ma - SHARE_MARGIN_GB)) -lt "$mem" ] && why="memavail ${ma}G-${SHARE_MARGIN_GB} < ${mem}G"
+    [ -z "$why" ] && [ $kind != build ] && [ $kind != cpu ] && [ $((g + mem)) -gt $((gt * SHARE_GTT_PCT / 100)) ] && why="gtt ${g}+${mem}G > ${SHARE_GTT_PCT}% of ${gt}G"
+    [ -z "$why" ] && [ "$ld" = 1 ] && [ "$nl" -gt 0 ] && why="model load beside a model-loading sibling (one load at a time)"
+    if [ -z "$why" ]; then SHT=$(date +%s); shwrite "$name" "$mem" "$ld" -; showner; exec 7>&-; HELD=2; shsee
+      SHGATE="share joined $(echo $SHSEEN | tr " " ",") mem=${mem}G load=$ld ledger=$((sum + mem))G memavail=${ma}G gtt=${g}G$([ $(( SHT - t0 )) -gt 0 ] && echo " waited $(( SHT - t0 ))s")$bfn"; return 0; fi
+    exec 7>&-; [ "$last" != "$why" ] && { echo "$(ts) share $name: not admitted: $why"; last=$why; }
+    [ "$why" = "sibling still settling" ] && { sleep 3; continue; }   # keep -s: bounded by the sibling's settle
+    flock -u 9; hs=0; sleep 10
+  done; }
+share_drop() { exec 7>>"$SHM"; flock 7; rm -f "$SHD/$$"; showner; exec 7>&-; exec 9>&-; HELD=0; }
+share_settle() {   # first-in share GPU cell: settle (GTT, MemAvailable >= mem, SETTLE_S), no cooldown
+  local i g ma tt=""; [ -n "${KLT_TEST_NOSETTLE:-}" ] && { echo "test-nosettle"; return 0; }
+  [ -x "$TTMD" ] && tt=$("$TTMD" $1)
+  for i in $(seq 120); do g=$(( $(cat $GPU/mem_info_gtt_used) >> 30 )); ma=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+    [ $g -le $SETTLE_GTT_GB ] && [ $ma -ge $1 ] && { sleep "$SETTLE_S"; echo "${tt:-ttm=na} gtt=${g}G memavail=${ma}G"; return 0; }; sleep 5; done
+  echo "SETTLE-TIMEOUT gtt=${g}G memavail=${ma}G (need <=${SETTLE_GTT_GB}G, >=${1}G)"; return 1; }
+
+settle() { local i g ma t0=$(date +%s) tk te
+  [ -n "${KLT_TEST_NOSETTLE:-}" ] && { echo "test-nosettle"; return 0; }   # test hook only (private KLT_HOME runs)
+  for i in $(seq 0 5 "$COOL_S"); do tk=$(tcpu); te=$(tgpu); [ $tk -lt $COOL_TCTL ] && [ $te -lt $COOL_EDGE ] && break; sleep 5; done
+  local cd="cooldown=$(( $(date +%s) - t0 ))s(tctl $tk,edge $te)"
+  local tt=""; [ -x "$TTMD" ] && tt=$("$TTMD" $MEM_GB)
+  for i in $(seq 120); do g=$(( $(cat $GPU/mem_info_gtt_used) >> 30 )); ma=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+    [ $g -le $SETTLE_GTT_GB ] && [ $ma -ge $MEM_GB ] && { sleep "$SETTLE_S"; echo "$cd ${tt:-ttm=na} gtt=${g}G memavail=${ma}G"; return 0; }; sleep 5; done
+  echo "$cd SETTLE-TIMEOUT gtt=${g}G memavail=${ma}G (need <=${SETTLE_GTT_GB}G, >=${MEM_GB}G)"; return 1; }
+
+summ() { local kind=$1 d=$2 s
+  case $kind in
+    bench) s=$(grep -a '^{' $d/stdout.log | python3 -c '
+import sys,json
+for l in sys.stdin:
+  try: j=json.loads(l)
+  except Exception: continue
+  t=("pp%d"%j["n_prompt"]) if j.get("n_prompt") else ("tg%d"%j.get("n_gen",0))
+  print("%s@d%d:%.2f+-%.2f"%(t,j.get("n_depth",0),j["avg_ts"],j["stddev_ts"]),end=" ")' 2>/dev/null);;
+    tbo) s=$(sed 's/\x1b\[[0-9;]*m//g' $d/stdout.log | awk '/tests passed/{p=p $1 " "} /FAIL/{n++; if(n<=3){sub(/^ +/,""); f=f substr($0,1,80) "; "}} END{printf "passed %s fails=%d %s", p, n, f}');;
+    suite) s=$(sed 's/\x1b\[[0-9;]*m//g' $d/stdout.log | awk '/tests passed/{p=p $1 " "; if(match($0,/\(cached [^ )]*/)) c=substr($0,RSTART+1,RLENGTH-1)} /FAIL/{n++; if(n<=3){sub(/^ +/,""); f=f substr($0,1,80) "; "}}
+      /^suite: shards=/{split($2,a,"="); split($3,w,"="); x="suite " a[2] " shards wall " w[2] " " $4 " " $8} /^suite: mon /{m=$3 " " $4 " " $6} END{printf "passed %s fails=%d %s%s%s", p, n, f, (c? "(" c ") ": ""), x (m? " " m: "")}');;
+    ppl) s=$(cat $d/stdout.log $d/stderr.log | grep -aE 'Final estimate|Mean +KLD|Same top p|RMS Δp|Mean PPL\(Q\) ' | sed -E 's/ +/ /g' | tr '\n' ';' | cut -c1-260);;
+    build) s="commit=$(git -C "$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' $3/CMakeCache.txt)" describe --always --dirty 2>/dev/null)";;
+    *) s=$(sed 's/\x1b\[[0-9;]*m//g' $d/stdout.log | grep -av '^[[:space:]]*$' | tail -1 | cut -c1-200);;
+  esac; echo "$s"; }
+
+CTMO=(); for c in "${CELLS[@]}"; do eval "set -- $c"; t=$TIMEOUT; shift 2; for a; do case $a in TIMEOUT=*) t=${a#TIMEOUT=};; [A-Za-z_]*=*) ;; *) break;; esac; done; CTMO+=($t); done
+CDS=0; CDN=0; CYW=0
+[ "$FAST" = 1 ] && echo "$$ $LABEL" > "$FASTW"
+say "START $LABEL cells=${#CELLS[@]} spec=$SPEC$([ "$FAST" = 1 ] && echo " FAST")$([ "$LANE" = share ] && echo " SHARE")"
+NFAIL=0; ci=-1
+for c in "${CELLS[@]}"; do eval "set -- $c"; kind=$1; name=$2; shift 2; ci=$((ci+1))
+  d=$OUT/cells/$name; mkdir -p $d; [ -e "$STOPF" ] && { say "STOP file present: $(cat $STOPF)"; exit 70; }
+  if [ $HELD = 1 ] && yield_pre && yield_live; then
+    rq=$KLT_QUEUE/pending/${SPEC##*/}; cp "$SPEC" "$rq.tmp" && mv -n "$rq.tmp" "$rq"
+    say "$LABEL: PREEMPTED (yield file $YF) before cell $name ($ci/${#CELLS[@]} cells done): held block stopped, spec requeued as $(basename "$rq" .job); the re-run appends below"
+    trap - EXIT; cleanup; exit 75; fi
+  envs=(); gatecell=0; tmo=$TIMEOUT; dsamp=$DRAM_SAMPLE; dper=$DRAM_PERIOD_MS; csamp=$CHAN_SAMPLE; cper=$CHAN_PERIOD_MS; hn=40; rout=-
+  ctr=$TRACE; ctset=$TRACE_SET; tsum=""; cqos=$QOS_US; qsum=""
+  csh=$SHARE; xld=""; cmg=""; cmod=${CMODEL[$ci]:-}; [ $kind = suite ] && [ "$HOLD_LOCK" != 1 ] && csh=1
+  if [ $kind = build ]; then while [[ ${1:-} =~ ^(GATE|TIMEOUT|SHARE|MEM_GB)= ]]; do case $1 in GATE=*) gatecell=${1#GATE=};; TIMEOUT=*) tmo=${1#TIMEOUT=};; SHARE=*) csh=${1#SHARE=};; MEM_GB=*) cmg=${1#MEM_GB=};; esac; shift; done; bdir=$1; shift; tg=(); for t in "$@"; do tg+=(--target "$t"); done; cmd=(nice -n 10 cmake --build "$bdir" -j "$JOBS" "${tg[@]}")
+  else while [[ ${1:-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do case $1 in TIMEOUT=*) tmo=${1#TIMEOUT=};; GATE=*) gatecell=${1#GATE=};; DRAM_SAMPLE=*) dsamp=${1#DRAM_SAMPLE=};;
+      SHARE=*) csh=${1#SHARE=};; SHARE_LOAD=*) xld=${1#SHARE_LOAD=};; MEM_GB=*) cmg=${1#MEM_GB=};; MODEL=*) cmod=${1#MODEL=}; envs+=("$1");;
+      DRAM_PERIOD_MS=*) dper=${1#DRAM_PERIOD_MS=};; CHAN_SAMPLE=*) csamp=${1#CHAN_SAMPLE=};; CHAN_PERIOD_MS=*) cper=${1#CHAN_PERIOD_MS=};; NOCHECK=*) ;;
+      TRACE=*) ctr=${1#TRACE=};; TRACE_SET=*) ctset=${1#TRACE_SET=};; QOS_US=*) cqos=${1#QOS_US=};;
+      N=*) if [ $kind = hazard ]; then hn=${1#N=}; else envs+=("$1"); fi;; REPEAT_OUT=*) if [ $kind = repeat ]; then rout=${1#REPEAT_OUT=}; else envs+=("$1"); fi;;
+      *) envs+=("$1");; esac; shift; done; cmd=("$@")
+    case $kind in hazard) cmd=(bash "$TOOLS/job-hazard" hazard "$hn" "$@"); envs+=("KLT_CELL=$d");; repeat) cmd=(bash "$TOOLS/job-hazard" repeat "$rout" "$@"); envs+=("KLT_CELL=$d");;
+      suite) cmd=(bash "$TOOLS/job-suite" run "$@"); envs+=("KLT_CELL=$d" "SUITE_ICD=${ICD:-system}");; esac
+    [ $kind = bench ] && ! printf '%s\n' "$@" | grep -qx -- '-o' && cmd+=(-o jsonl); fi
+  bin0=${cmd[0]}; case $kind in hazard|repeat) bin0=${cmd[4]};; suite) bin0=${cmd[3]};; esac
+  if [ $kind = suite ]; then   # master cache: a hit needs no lock and no GPU
+    if chf=$(env "${envs[@]}" bash "$TOOLS/job-suite" lookup "${cmd[@]:3}" 2>>$d/cache.txt); then
+      { echo "start=$(ts) host=$(hostname) kind=$kind cell=$name label=$LABEL (cache hit, no lock, no GPU)"; echo "gate: cache-hit $chf"; echo "argv: ${cmd[*]}"; echo "cell env: ${envs[*]}"
+        echo "end=$(ts) rc=0"; } > $d/meta.txt
+      say "cell $name rc=0 | $(summ suite $d) | cache-hit | cache-hit $(basename "$chf")"; continue; fi
+  fi
+  if [ $kind = build ]; then cload=0; else cload=$(shload "$kind" "$cmod" "$xld" "${cmd[@]}"); fi; cmem=$(shmem "$csh" "$kind" "$cmg" "$cload")
+  icdenv() { [ -n "$ICD" ] && envs=(VK_ICD_FILENAMES=$ICD VK_DRIVER_FILES=$ICD "LD_LIBRARY_PATH=$(dirname "$(readlink -f "$(command -v "${bin0}" || echo "${bin0}")")")${KLT_VK_LIBPATH:+:$KLT_VK_LIBPATH}" "${envs[@]}"); return 0; }
+  if [ "$csh" = 1 ]; then   # share cell: shared lock + admission; first-in GPU cells settle (no cooldown)
+    [ "$LANE" = share ] || { fast_yield; fast_defer; }
+    share_take "$name" "$kind" "$cmem" "$cload"; src=$?
+    [ $src = 2 ] && { say "STOP file present: $(cat $STOPF)"; exit 70; }
+    [ "$FAST" = 1 ] || [ "$LANE" = share ] || { grep -q "^$$ " "$NORMW" 2>/dev/null && rm -f "$NORMW"; }
+    gate=$SHGATE
+    if [ $src = 0 ] && [ $kind != build ] && [ $kind != cpu ] && [[ $SHGATE == "share first-in"* ]]; then ss=$(share_settle "$cmem") || src=1; gate="$gate $ss"; fi
+    if [ $src != 0 ]; then say "cell $name rc=3 SKIPPED $gate"; NFAIL=$((NFAIL+1)); lock_drop
+      [ "${gatecell:-0}" = 1 ] && { say "GATE $name failed (skipped): job ended"; exit 1; }; continue; fi
+    [ $kind != build ] && [ $kind != cpu ] && icdenv
+  else
+  lock_take "$name"; gate="lock-only"; progress_write "$name"
+  if [ $kind != build ] && [ $kind != cpu ]; then
+    gate=$(MEM_GB=$cmem settle) || { say "cell $name rc=3 SKIPPED $gate"; NFAIL=$((NFAIL+1)); [ $HOLD_LOCK = 1 ] || lock_drop
+      [ "${gatecell:-0}" = 1 ] && { say "GATE $name failed (skipped): job ended"; lock_drop; exit 1; }; continue; }
+    icdenv
+  fi
+  fi
+  [ -n "$YLD" ] && gate="$gate $YLD"; [ -n "$CYLD" ] && gate="$gate $CYLD"; CYLD=""; c0=$(date +%s)
+  if [ "$ctr" = auto ]; then ctr=0   # auto: trace decode-only llama-bench cells (-p 0 with -n > 0); explicit TRACE=0|1 wins
+    if [ $kind = bench ]; then ap=""; an=""; pv=""; for x in "${cmd[@]}"; do case $pv in -p|--n-prompt) ap=$x;; -n|--n-gen) an=$x;; esac; pv=$x; done
+      [ "$ap" = 0 ] && [ -n "$an" ] && [ "$an" != 0 ] && ctr=1; fi; fi
+  [ "$ctr" = 1 ] && [ $kind != build ] && cmd=(bash "$KLT_ROOT/samplers/trace/trace-run" --set "$ctset" --out "$d/trace.gz" -- "${cmd[@]}")
+  [ $kind = build ] || [ $kind = cpu ] && cqos=0
+  [ "$cqos" != 0 ] && cmd=(bash "$TOOLS/qos-run" "$cqos" "$d/qos.txt" -- "${cmd[@]}")
+  { echo "start=$(ts) host=$(hostname) kind=$kind cell=$name label=$LABEL timeout=$tmo"; echo "gate: $gate"; echo "cmdline: $(cat /proc/cmdline)"
+    echo "argv: ${cmd[*]}"; echo "cell env: ${envs[*]}"; env | grep -E '^(GGML|VK_|LLAMA)' | sort | sed 's/^/env: /'
+    b=$(readlink -f "$(command -v "${bin0}" 2>/dev/null || echo "${bin0}")"); echo "bin: $b $(git -C "$(dirname "$b")" describe --always --dirty 2>/dev/null)"; } > $d/meta.txt
+  kstart=$(date '+%Y-%m-%d %H:%M:%S')
+  CS=""; [ "$csamp" = 1 ] && [ $kind != build ] && [ $kind != cpu ] && CS=$(CHAN_WATCH_PID=$$ "$KLT_ROOT/mem/chan-start.sh" $d/chan.tsv "$cper" 9>&- 2>> $d/meta.txt)
+  setsid env "${envs[@]}" timeout -s TERM -k 30 "$tmo" "${cmd[@]}" > $d/stdout.log 2> $d/stderr.log 9>&- & CP=$!
+  [ $HELD = 2 ] && { shwrite "$name" "$cmem" "$cload" "$CP"; echo "share: $SHGATE" >> $d/meta.txt; }
+  DP=""; if [ "$dsamp" = 1 ] && [ $kind != build ] && [ $kind != cpu ]; then python3 "$KLT_ROOT/mem/dram-sample.py" $d/dram.tsv $CP "$dper" 9>&- 2>> $d/meta.txt & DP=$!; fi
+  foreign=""; fnote=""; FDIRTY=" "; FNOTE=" "; FSIB=" "; dev=""; k=0; kill=""
+  while kill -0 $CP 2>/dev/null; do
+    g=$(( $(cat $GPU/mem_info_gtt_used) >> 20 )); v=$(( $(cat $GPU/mem_info_vram_used) >> 20 )); ma=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+    echo "$(date -u +%T) $g $v $ma $(( $(cat $HA/freq1_input 2>/dev/null || echo 0) / 1000000 )) $(tgpu) $(tcpu) $(( $(cat $HA/power1_average 2>/dev/null || cat $HA/power1_input 2>/dev/null || echo 0) / 1000000 )) $(cat $GPU/gpu_busy_percent)" >> $d/samp.tsv
+    [ $VRAM_KILL_MIB -gt 0 ] && [ $v -gt $VRAM_KILL_MIB ] && { kill="VRAM_KILL ${v}MiB"; kill -KILL -- -$CP; }
+    [ $ma -lt $MEM_KILL_MIB ] && [ $kind != build ] && { kill="MEM_KILL memavail ${ma}MiB"; kill -KILL -- -$CP; }
+    fwatch $d
+    if [ $HELD = 2 ]; then shsee; [ -e "$STOPF" ] && [ -z "$kill" ] && { kill="STOP-GPU appeared mid-cell (sibling device error?)"; kill -TERM -- -$CP; }; fi
+    if [ $((k % 3)) = 0 ]; then dev=$(journalctl -k --since "$kstart" --no-pager 2>/dev/null | grep -aE "$DEVERR" | head -1 | cut -c1-160)
+      [ -n "$dev" ] && { kill -TERM -- -$CP; break; }; fi
+    k=$((k+1)); sleep 2; done
+  wait $CP; rc=$?; CP=""; dsum=""; csum=""; CDS=$((CDS + $(date +%s) - c0)); CDN=$((CDN + 1))
+  if [ "$csamp" = 1 ] && [ $kind != build ] && [ $kind != cpu ]; then csum=$("$KLT_ROOT/mem/chan-stop.sh" "$CS" $d/chan.tsv); echo "$csum" >> $d/meta.txt; fi
+  if [ -n "$DP" ]; then wait $DP; dsum=$(python3 "$KLT_ROOT/mem/dram-summary.py" $d/dram.tsv --line 2>&1 | tail -1); echo "$dsum" >> $d/meta.txt; fi
+  if [ "$ctr" = 1 ] && [ $kind != build ]; then
+    if grep -q SETUP_FAILED $d/trace.meta.txt 2>/dev/null; then tsum="trace SETUP_FAILED (untraced, see trace.meta.txt)"
+    elif [ -s $d/trace.gz ]; then tsum="$(python3 "$KLT_ROOT/samplers/trace/analyze.py" $d/trace.gz --auto --line --report $d/trace-summary.txt 2>&1 | tail -1) set=$ctset"
+    else tsum="trace MISSING (cell killed mid-dump?)"; fi; echo "$tsum" >> $d/meta.txt; fi
+  [ "$cqos" != 0 ] && { qsum=$(grep -a '^qos ' $d/qos.txt 2>/dev/null | tail -1); qsum=${qsum:-qos MISSING (no qos.txt line)}; echo "$qsum" >> $d/meta.txt; }
+  [ -z "$dev" ] && dev=$( { journalctl -k --since "$kstart" --no-pager 2>/dev/null; cat $d/stdout.log $d/stderr.log; } | grep -aE "$DEVERR" | head -1 | cut -c1-160)
+  echo "end=$(ts) rc=$rc ${kill:+kill=$kill} ${foreign:+foreign=$foreign} ${fnote:+foreign-note=$fnote}" >> $d/meta.txt
+  th=$(awk '$9>=90{s+=$5;w+=$8;n++} {if($7>t)t=$7; if($2>gp)gp=$2} END{printf "busy90 n=%d sclk %.0f W %.0f tctl_max %d gtt_peak %dM", n, (n?s/n:0), (n?w/n:0), t, gp}' $d/samp.tsv 2>/dev/null)
+  [ $rc = 124 ] && kill="${kill:+$kill }TIMEOUT ${tmo}s"
+  [ $rc != 0 ] && NFAIL=$((NFAIL+1))
+  [ $HELD = 2 ] && { ov=$(echo $SHSEEN | tr ' ' ','); gate="$gate overlap=${ov:-none}"; echo "share-overlap: ${ov:-none}" >> $d/meta.txt; }
+  say "cell $name rc=$rc${foreign:+ DIRTY foreign=$foreign}${fnote:+ fnote=cpu-only:${fnote% }}${kill:+ $kill} | $(summ $kind $d ${bdir:-}) | $th${dsum:+ | $dsum}${csum:+ | $csum}${tsum:+ | $tsum}${qsum:+ | $qsum} | $gate"
+  if [ -n "$dev" ]; then if [ $HELD = 2 ]; then echo "$(ts) job-run $LABEL cell $name (SHARE cell; concurrent share cells: ${SHSEEN# }; attribution ambiguous): $dev" >> "$STOPF"; else echo "$(ts) job-run $LABEL cell $name: $dev" > "$STOPF"; fi; say "DEVICE ERROR in $name: $dev -> STOP written ($STOPF); stop all GPU work"; exit 70; fi
+  [ $HOLD_LOCK = 1 ] || lock_drop
+  if [ "${gatecell:-0}" = 1 ] && [ $rc != 0 ]; then say "GATE $name failed rc=$rc: job ended, later cells not run"; lock_drop
+    python3 "$TOOLS/job-summary.py" "$OUT" > "$OUT/SUMMARY.txt" 2>&1; exit 1; fi
+done
+lock_drop
+python3 "$TOOLS/job-summary.py" "$OUT" > "$OUT/SUMMARY.txt" 2>&1
+[ "$FAST" = 1 ] && grep -q "^$$ " "$FASTW" 2>/dev/null && rm -f "$FASTW"
+if [ $NFAIL = 0 ]; then say "$LABEL-DONE"; trap - EXIT; exit 0; else exit 1; fi

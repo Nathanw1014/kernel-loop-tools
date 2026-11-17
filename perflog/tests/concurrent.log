@@ -1,0 +1,8 @@
+synthetic fixture: concurrent logger, one graph
+----------------
+Vulkan Timings:
+ADD, RMS_NORM_MUL RMS_NORM(4096,512,1,1): 2 x 30 us = 60 us
+FLASH_ATTN_EXT dst(128,32,512,1),  q(128,512,32,1),  k(128,512,8,1),  v(128,512,8,1),  m(512,512,1,1): 1 x 140 us = 140 us
+GET_ROWS: 1 x 5 us = 5 us
+MUL_MAT q4_K m=4096 n=512 k=4096, MUL_MAT q4_K m=1024 n=512 k=4096: 2 x 600 us = 1200 us (35779.6 GFLOPS/s)
+Total time: 1405 us.

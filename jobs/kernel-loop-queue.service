@@ -1,0 +1,30 @@
+[Unit]
+Description=kernel-loop-tools job-queue: FIFO GPU job runner for job-run specs
+
+# Install: copy (or symlink) to ~/.config/systemd/user/, edit the paths below, then
+#   systemctl --user daemon-reload && systemctl --user enable --now kernel-loop-queue
+# Never restart this unit while a job runs (systemd kills its cgroup, running job included):
+#   job-queue hold; job-wait --lock-free; systemctl --user restart kernel-loop-queue; job-queue release
+
+[Service]
+# Path of your kernel-loop-tools checkout (edit if it is not ~/kernel-loop-tools).
+Environment=KLT_ROOT=%h/kernel-loop-tools
+# Every KLT_* / SUITE_* value you set in your shell must be set here too, or the daemon uses a different lock / queue / driver:
+#Environment=KLT_HOME=%h/.kernel-loop
+#Environment=KLT_RESULTS=%h/kernel-loop-results
+#Environment=KLT_VK_ICD=/path/to/your/icd.x86_64.json
+#Environment=KLT_VK_LIBPATH=/path/to/extra/libs
+#Environment=KLT_MEM_GB=32
+#Environment=KLT_IDLE_MARGIN_GB=6
+#Environment=KLT_VRAM_KILL_MIB=0
+#Environment=KLT_YIELD_FILE=%h/.kernel-loop/YIELD
+#Environment=SUITE_MASTER_REF=origin/master
+#Environment=SUITE_PROFILE=%h/.kernel-loop/suite-cache/optimes.json
+ExecStart=/bin/bash ${KLT_ROOT}/jobs/job-queue daemon
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

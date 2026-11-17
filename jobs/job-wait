@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# job-wait: block until a job finishes, then print ONE compact summary. Meant to run as a single background call (an agent's
+# background tool call, or `job-wait ... &`) so a long job costs one notification instead of many tail / stat / sleep polls.
+#
+#   job-wait CONDITION... [--timeout 12h] [--interval 30] [--tail 15] [--err FILE]...
+#   conditions (first one met ends the wait):
+#     --marker NAME --file F   a NEW line in F ending "Z NAME" (RESULTS.txt convention, e.g. MYJOB-DONE)
+#     --match REGEX --file F   a NEW line in F matching REGEX (grep -E)
+#     --pid PID                PID has exited
+#     --label L                the GPU lock owner is no longer label L
+#     --lock-free              the GPU lock owner file ($KLT_LOCK.owner) is empty
+#     --quiet SECS --file F    F not written for SECS seconds
+#   Lines already in F at start never count (no stale-marker no-op). F, and every --err file, are scanned for device errors.
+#
+# Exit: 0 done, 1 job failed (EXITED rc!=0 in F), 2 DEVICE ERROR (DeviceLost / Not enough memory / BO_VA: stop all GPU work),
+# 3 timeout, 4 --pid exited before --marker/--match appeared.
+set -u
+. "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+FILE=""; MARKER=""; MATCH=""; PID=""; LABEL=""; LOCKFREE=0; QUIET=""; TIMEOUT=12h; IV=30; TAILN=15; ERRS=()
+while [ $# -gt 0 ]; do case $1 in
+  --file) FILE=$2; shift 2;; --marker) MARKER=$2; shift 2;; --match) MATCH=$2; shift 2;;
+  --pid) PID=$2; shift 2;; --label) LABEL=$2; shift 2;; --lock-free) LOCKFREE=1; shift;; --quiet) QUIET=$2; shift 2;;
+  --timeout) TIMEOUT=$2; shift 2;; --interval) IV=$2; shift 2;; --tail) TAILN=$2; shift 2;; --err) ERRS+=("$2"); shift 2;;
+  -h|--help) usage; exit 0;; *) echo "job-wait: unknown arg $1" >&2; exit 2;; esac; done
+R=$KLT_RESULTS; LOCKO=$KLT_LOCK.owner
+
+[ -n "$MARKER$MATCH$QUIET" ] && [ -z "$FILE" ] && { echo "job-wait: --marker/--match/--quiet need --file" >&2; exit 2; }
+[ -z "$MARKER$MATCH$PID$LABEL$QUIET" ] && [ $LOCKFREE = 0 ] && { echo "job-wait: no condition given" >&2; exit 2; }
+[ -n "$PID" ] && ! kill -0 "$PID" 2>/dev/null && { echo "job-wait: pid $PID is not running at start" >&2; exit 4; }
+[ -n "$MARKER" ] && MATCH="Z $MARKER\$"
+case $TIMEOUT in *h) TO=$(( ${TIMEOUT%h} * 3600 ));; *m) TO=$(( ${TIMEOUT%m} * 60 ));; *s) TO=${TIMEOUT%s};; *) TO=$TIMEOUT;; esac
+DEVERR='DeviceLost|ErrorDeviceLost|Not enough memory|BO_VA|amdgpu.*(ring .* timeout|GPU reset)'
+
+size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+OFF=0; [ -n "$FILE" ] && OFF=$(size "$FILE")
+declare -A EOFF; for e in "${ERRS[@]}"; do EOFF[$e]=$(size "$e"); done
+new() { local f=$1 o=$2; [ -r "$f" ] && tail -c +$((o+1)) "$f" 2>/dev/null | tr -d '\r'; }   # bytes written since start
+
+t0=$(date +%s); rc=""; why=""
+while :; do
+  now=$(date +%s)
+  if [ -n "$FILE" ]; then
+    body=$(new "$FILE" "$OFF")
+    if grep -qaE "$DEVERR" <<<"$body"; then rc=2; why="device error in $FILE"; break; fi
+    if grep -qaE 'EXITED rc=[1-9]' <<<"$body"; then rc=1; why="job EXITED non-zero"; break; fi
+    if [ -n "$MATCH" ] && grep -qaE "$MATCH" <<<"$body"; then rc=0; why="matched: $(grep -aE "$MATCH" <<<"$body" | tail -1 | cut -c1-160)"; break; fi
+    if [ -n "$QUIET" ] && [ -e "$FILE" ] && [ $(( now - $(stat -c %Y "$FILE") )) -ge "$QUIET" ]; then rc=0; why="$FILE quiet ${QUIET}s"; break; fi
+  fi
+  for e in "${ERRS[@]}"; do grep -qaE "$DEVERR" <<<"$(new "$e" "${EOFF[$e]}")" && { rc=2; why="device error in $e"; break 2; }; done
+  if [ -n "$PID" ] && ! kill -0 "$PID" 2>/dev/null; then
+    if [ -n "$MATCH" ]; then sleep 2; body=$(new "$FILE" "$OFF")   # the job may write its marker as it exits
+      grep -qaE "$MATCH" <<<"$body" && { rc=0; why="matched at exit"; } || { rc=4; why="pid $PID exited without the marker"; }
+    else rc=0; why="pid $PID exited"; fi; break; fi
+  lo=$(cat "$LOCKO" 2>/dev/null)
+  if [ -n "$LABEL" ] && ! grep -q "label=$LABEL\b" <<<"$lo"; then rc=0; why="lock no longer held by $LABEL (now: ${lo:-free})"; break; fi
+  if [ $LOCKFREE = 1 ] && [ -z "$lo" ]; then rc=0; why="lock free"; break; fi
+  [ $(( now - t0 )) -ge "$TO" ] && { rc=3; why="timeout after $TIMEOUT"; break; }
+  sleep "$IV"
+done
+
+el=$(( $(date +%s) - t0 )); word=(DONE FAILED DEVICE-ERROR TIMEOUT NO-MARKER)
+echo "job-wait: ${word[$rc]} rc=$rc after $((el/3600))h$(( el%3600/60 ))m: $why"
+[ $rc = 2 ] && echo "!! DEVICE ERROR: stop all GPU work on this machine; do not start the next job"
+if [ -n "$FILE" ] && [ "$TAILN" != 0 ]; then
+  echo "--- new lines in ${FILE#$R/} (last $TAILN):"
+  new "$FILE" "$OFF" | sed 's/\x1b\[[0-9;]*m//g' | grep -av '^[[:space:]]*$' | tail -n "$TAILN" | cut -c1-300
+fi
+for e in "${ERRS[@]}"; do m=$(new "$e" "${EOFF[$e]}" | grep -aE "$DEVERR" | tail -3 | cut -c1-200); [ -n "$m" ] && echo "--- $e: $m"; done
+bash "$(dirname "$(readlink -f "$0")")/gpu-status" -n 0 2>/dev/null | sed -n '1,4p'
+exit $rc

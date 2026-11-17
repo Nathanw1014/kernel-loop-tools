@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+# build outputs
+mem/bin/
+jobs/qoshold
+bench/dram-mm
+bench/mmid_det
+bench/kv-membench/bench
+bench/kv-membench/bench_spv.h
+bench/kv-membench/*.spv

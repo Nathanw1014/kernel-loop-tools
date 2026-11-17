@@ -1,0 +1,19 @@
+# abba.sh model preset: copy, edit, pass the path as abba.sh's second argument. Sourced by bash.
+#
+#   MODEL   model file (required)
+#   ARGS    llama-bench flags for this model (array); abba.sh adds -m, -p, -n, -d, -r and -o jsonl
+#   MEM_GB  MemAvailable (GB) that must hold before each cell: the model's resident size plus a few GB
+#           for context and compute buffers. Read it once from `free -g` while the model is loaded.
+# Optional (environment wins over the preset when both set them):
+#   PP      prompt tokens per test (default 2048)
+#   DEPTHS  -d list (default 0,8192,32768)
+#   NGEN    tg tokens after each prefill (default 32)
+#   REPS    -r inside each launch (default 2)
+
+MODEL=/path/to/model.gguf
+ARGS=(-ngl 99 -fa 1 -b 2048 -ub 2048)
+MEM_GB=24
+
+# Dense models often prefer a smaller ubatch; MoE models a large one. Keep one preset per model and recipe.
+# PP=2048
+# DEPTHS=0,8192,32768
