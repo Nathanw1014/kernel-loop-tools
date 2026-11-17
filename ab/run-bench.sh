@@ -74,6 +74,7 @@ META="$R/raw/$ID.meta"; RAW="$R/raw/$ID.raw"; JSON="$R/raw/$ID.json"
 if [ "$BACKEND" = vulkan ] && [ -n "$KLT_VK_ICD" ]; then
   [ -f "$KLT_VK_ICD" ] || { echo "[run-bench] KLT_VK_ICD=$KLT_VK_ICD missing; refusing to run (unset it for the system driver)" >&2; exit 78; }
   export VK_ICD_FILENAMES=$KLT_VK_ICD VK_DRIVER_FILES=$KLT_VK_ICD
+  [ -n "${KLT_VK_LIBPATH:-}" ] && export LD_LIBRARY_PATH=$KLT_VK_LIBPATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 fi
 
 # A binary built without its git dir (e.g. inside a container) reports build_commit "unknown".

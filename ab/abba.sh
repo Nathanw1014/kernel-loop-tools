@@ -41,6 +41,7 @@ BUSY_PROCS=${ABBA_BUSY_PROCS:-llama-quantize|llama-imatrix}; CELL_TO=${ABBA_CELL
 CARD=$(klt_gpu_card) || { [ $DRY = 1 ] || { echo "no amdgpu card found (set KLT_GPU_CARD=/sys/class/drm/cardN/device)"; exit 2; }; }
 GTT=$CARD/mem_info_gtt_used
 ICDENV=(); [ -n "$KLT_VK_ICD" ] && ICDENV=(VK_ICD_FILENAMES=$KLT_VK_ICD VK_DRIVER_FILES=$KLT_VK_ICD)
+[ -n "${KLT_VK_LIBPATH:-}" ] && export LD_LIBRARY_PATH=$KLT_VK_LIBPATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}   # e.g. the ICD's libdrm
 mkdir -p "$OUT"; RES=$OUT/RESULTS.txt
 say(){ echo "$(date -u +%FT%TZ) $*" | tee -a "$RES"; }
 declare -A BIN ENVS; ORDER=()

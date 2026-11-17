@@ -38,7 +38,8 @@ All state goes through `lib/klt-env.sh`; override any of these in your environme
 | `KLT_RESULTS` | `~/kernel-loop-results` | record root; job `OUT` dirs must live under it |
 | `KLT_LOCK` | `$KLT_HOME/gpu.lock` | the one GPU flock every tool takes |
 | `KLT_STOP` | `$KLT_HOME/STOP-GPU` | written on a device error; every tool refuses to start while it exists |
-| `KLT_VK_ICD` | unset (system driver) | optional Vulkan ICD json for `MESA=release` cells |
+| `KLT_VK_ICD` | unset (system driver) | optional Vulkan ICD json pinned for every run (`MESA=release` cells, `abba.sh`, `run-bench.sh`, `batch-validate.sh`, `bisect-pred.sh`) |
+| `KLT_VK_LIBPATH` | unset | extra library dirs that ICD needs (for example a matching libdrm), prepended to `LD_LIBRARY_PATH` |
 | `KLT_GPU_CARD` | first amdgpu card | `/sys/class/drm/cardN/device` |
 
 Per-tool knobs are documented in each tool's header (`--help` or the top comment).

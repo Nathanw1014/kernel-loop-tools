@@ -18,6 +18,9 @@ set -uo pipefail
 case ${1:-} in -h|--help|'') sed -n '2,16p' "$0"; exit 2;; esac
 BD=$1; MODE=${2:-}; shift; [ $# -gt 0 ] && shift
 . "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
+# KLT_VK_ICD pins the Vulkan ICD (KLT_VK_LIBPATH: extra library dirs for it, e.g. a matching libdrm), as in abba.sh / job-run.
+[ -n "${KLT_VK_ICD:-}" ] && { [ -f "$KLT_VK_ICD" ] || { echo "KLT_VK_ICD missing: $KLT_VK_ICD" >&2; exit 128; }; export VK_ICD_FILENAMES=$KLT_VK_ICD VK_DRIVER_FILES=$KLT_VK_ICD; }
+[ -n "${KLT_VK_LIBPATH:-}" ] && export LD_LIBRARY_PATH=$KLT_VK_LIBPATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 [ -e "$KLT_STOP" ] && { echo "bisect-pred: $KLT_STOP exists, aborting the bisect" >&2; exit 128; }
 case $MODE in
   ops) [ $# -ge 1 ] || { echo "ops needs an op filter" >&2; exit 128; };;
@@ -34,8 +37,8 @@ B=$BD/bin
 exec 9>"$KLT_LOCK"; flock 9; echo "pid=$$ label=bisect-$SHA started=$(date -Is)" > "$KLT_LOCK.owner"
 while [ $(( $(cat "$GTT") / 1048576 )) -gt $(( ${GTT_MAX_GIB:-2} * 1024 )) ] || [ $(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo) -lt "${MEM_GB:-0}" ]; do sleep 10; done
 case $MODE in
-  ops) LD_LIBRARY_PATH=$B timeout 3600 "$B/test-backend-ops" test -b "${BACKEND:-Vulkan0}" -o "$1" ${2:+-p "$2"} 9>&- > "$LOG" 2>&1 ;;
-  ppl) LD_LIBRARY_PATH=$B "$B/llama-perplexity" -m "$MODEL" -f "$CORPUS" -c 4096 -b 2048 -ub 2048 --chunks 4 -ngl 999 -fa on "${F[@]}" 9>&- > "$LOG" 2>&1 ;;
+  ops) LD_LIBRARY_PATH=$B${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} timeout 3600 "$B/test-backend-ops" test -b "${BACKEND:-Vulkan0}" -o "$1" ${2:+-p "$2"} 9>&- > "$LOG" 2>&1 ;;
+  ppl) LD_LIBRARY_PATH=$B${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} "$B/llama-perplexity" -m "$MODEL" -f "$CORPUS" -c 4096 -b 2048 -ub 2048 --chunks 4 -ngl 999 -fa on "${F[@]}" 9>&- > "$LOG" 2>&1 ;;
 esac
 rm -f "$KLT_LOCK.owner"; exec 9>&-
 if grep -aqE 'DeviceLost|Not enough memory for command|BO_VA' "$LOG"; then

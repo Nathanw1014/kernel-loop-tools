@@ -1,5 +1,7 @@
 // mmid_det: whole-graph MUL_MAT_ID determinism, exactness and timing bench on Vulkan0, with an optional fused epilogue.
 // usage: mmid_det <type> <m> <k> <n_tokens> <bcast_b 0|1> <fused 0|1> [time_reps=20]
+// build: g++ -O2 -std=c++17 -I<llama.cpp>/ggml/include mmid_det.cpp -o mmid_det -L<build>/bin -lggml -lggml-base -lggml-cpu \
+//          -Wl,-rpath,<build>/bin
 //   type      weight type (ggml type name, e.g. q4_K); weights are [k x m] per expert
 //   bcast_b   1 = one B row per token shared by every selected expert (gate / up form), 0 = one B row per selected expert (down form)
 //   fused     1 = MUL_MAT_ID -> MUL by a per-expert router weight -> CAST f16 (the chain a MoE down projection runs), so a backend

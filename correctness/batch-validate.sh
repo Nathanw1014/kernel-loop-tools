@@ -17,6 +17,8 @@
 # Env: BACKEND (test-backend-ops -b, default Vulkan0), MEM_GB (MemAvailable before each model cell, default 0 = off:
 # set it to the model's resident size plus a few GB), SUITE_MEM_GB (same for op-test cells, default 0), GTT_MAX_GIB
 # (default 2), SETTLE_S (sleep after the memory gate, default 30), LOAD_MAX (loadavg gate, default 4).
+# SUITE_ARGS: extra test-backend-ops args for stage 1, e.g. "-o MUL_MAT,SOFT_MAX" to limit it to the ops the batch touches
+# (default: the full suite).
 # Results: <out-dir>/BATCH.txt; raw logs next to it.
 set -uo pipefail
 case ${1:-} in -h|--help|'') sed -n '2,20p' "$0"; exit 2;; esac
@@ -26,6 +28,9 @@ MFLAGS=("$@")
 [ -r "$KNOBS" ] && [ -r "$MODEL" ] && [ -r "$W" ] || { echo "knobs file, model or corpus not readable" >&2; exit 2; }
 . "$(dirname "$(readlink -f "$0")")/../lib/klt-env.sh"
 [ -e "$KLT_STOP" ] && { echo "$KLT_STOP exists (device error recorded); refusing to run" >&2; exit 70; }
+# KLT_VK_ICD pins the Vulkan ICD (KLT_VK_LIBPATH: extra library dirs for it, e.g. a matching libdrm), as in abba.sh / job-run.
+[ -n "${KLT_VK_ICD:-}" ] && { [ -f "$KLT_VK_ICD" ] || { echo "KLT_VK_ICD missing: $KLT_VK_ICD" >&2; exit 78; }; export VK_ICD_FILENAMES=$KLT_VK_ICD VK_DRIVER_FILES=$KLT_VK_ICD; }
+[ -n "${KLT_VK_LIBPATH:-}" ] && export LD_LIBRARY_PATH=$KLT_VK_LIBPATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 GPU=$(klt_gpu_card) || { echo "no amdgpu card (set KLT_GPU_CARD)" >&2; exit 2; }
 GTT=$GPU/mem_info_gtt_used; BK=${BACKEND:-Vulkan0}; MEM=${MEM_GB:-0}; SMEM=${SUITE_MEM_GB:-0}
 mkdir -p $OUT_DIR; OUT=$OUT_DIR/BATCH.txt
@@ -48,7 +53,7 @@ knob_lines(){ grep -vE '^\s*(#|$)' $KNOBS | sed 's/#.*//'; }
 
 say "=== batch: base $BASE  tip $TIP  knobs $(knob_lines | wc -l)"
 # ---- 1 op suites
-suite(){ env "$@" LD_LIBRARY_PATH=$BIN timeout 7200 $BIN/test-backend-ops test -b $BK 9>&- > $OUT_DIR/suite-$TAG.log 2>&1; fatal $OUT_DIR/suite-$TAG.log
+suite(){ env "$@" LD_LIBRARY_PATH=$BIN${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} timeout 7200 $BIN/test-backend-ops test -b $BK ${SUITE_ARGS:-} 9>&- > $OUT_DIR/suite-$TAG.log 2>&1; fatal $OUT_DIR/suite-$TAG.log
   say "suite $TAG: $(sed -E 's/\x1b\[[0-9;]*m//g' $OUT_DIR/suite-$TAG.log | grep -E 'tests passed' | tail -1)"; failset $OUT_DIR/suite-$TAG.log > $OUT_DIR/fails-$TAG.txt; }
 BIN=$BASE TAG=base cell suite-base $SMEM suite X=1
 BIN=$TIP  TAG=tip  cell suite-tip  $SMEM suite X=1
@@ -63,7 +68,7 @@ if [ -s $OUT_DIR/fails-new.txt ]; then
   ops=$(sed -E 's/\(.*//' $OUT_DIR/fails-new.txt | sort -u | paste -sd'|')
   iso(){ local i=0; while read -r k; do i=$((i+1))
       : > $OUT_DIR/iso-$i.log
-      for op in ${ops//|/ }; do env $k LD_LIBRARY_PATH=$TIP timeout 3600 $TIP/test-backend-ops test -b $BK -o "$op" 9>&- >> $OUT_DIR/iso-$i.log 2>&1; done
+      for op in ${ops//|/ }; do env $k LD_LIBRARY_PATH=$TIP${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} timeout 3600 $TIP/test-backend-ops test -b $BK -o "$op" 9>&- >> $OUT_DIR/iso-$i.log 2>&1; done
       fatal $OUT_DIR/iso-$i.log
       failset $OUT_DIR/iso-$i.log > $OUT_DIR/iso-$i.fails
       local left=$(comm -12 $OUT_DIR/fails-new.txt $OUT_DIR/iso-$i.fails | wc -l)
@@ -74,7 +79,7 @@ if [ -s $OUT_DIR/fails-new.txt ]; then
 fi
 
 # ---- 3 perplexity: base, tip, tip with each knob alone
-ppl(){ env "$@" LD_LIBRARY_PATH=$BIN $BIN/llama-perplexity -m $MODEL -f $W -c 4096 -b 2048 -ub 2048 --chunks 4 -ngl 999 -fa on "${MFLAGS[@]}" 9>&- > $OUT_DIR/ppl-$TAG.log 2>&1; fatal $OUT_DIR/ppl-$TAG.log
+ppl(){ env "$@" LD_LIBRARY_PATH=$BIN${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} $BIN/llama-perplexity -m $MODEL -f $W -c 4096 -b 2048 -ub 2048 --chunks 4 -ngl 999 -fa on "${MFLAGS[@]}" 9>&- > $OUT_DIR/ppl-$TAG.log 2>&1; fatal $OUT_DIR/ppl-$TAG.log
   say "ppl $TAG [$*]: $(grep -aoE 'Final estimate: PPL = [0-9.]+ \+/- [0-9.]+' $OUT_DIR/ppl-$TAG.log) | $(grep -aoE '\[[0-9]+\][0-9.]+' $OUT_DIR/ppl-$TAG.log | tr '\n' ' ')"; }
 say "=== 3 perplexity"
 BIN=$BASE TAG=base cell ppl-base $MEM ppl X=1
@@ -82,7 +87,7 @@ BIN=$TIP  TAG=tip  cell ppl-tip  $MEM ppl X=1
 i=0; while read -r k; do i=$((i+1)); BIN=$TIP TAG=knob$i cell ppl-k$i $MEM ppl $k; done < <(knob_lines)
 
 # ---- 4 ABBA perf
-bench(){ LD_LIBRARY_PATH=$BIN $BIN/llama-bench -m $MODEL -ngl 99 -fa 1 "${MFLAGS[@]}" -p 2048 -n 0 -b 2048 -ub 2048 -d 0,16384 -r 2 -o jsonl 9>&- > $OUT_DIR/bench-$TAG.jsonl 2> $OUT_DIR/bench-$TAG.err; fatal $OUT_DIR/bench-$TAG.err
+bench(){ LD_LIBRARY_PATH=$BIN${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} $BIN/llama-bench -m $MODEL -ngl 99 -fa 1 "${MFLAGS[@]}" -p 2048 -n 0 -b 2048 -ub 2048 -d 0,16384 -r 2 -o jsonl 9>&- > $OUT_DIR/bench-$TAG.jsonl 2> $OUT_DIR/bench-$TAG.err; fatal $OUT_DIR/bench-$TAG.err
   say "bench $TAG: $(python3 -c "
 import json
 rows=[json.loads(l) for l in open('$OUT_DIR/bench-$TAG.jsonl') if l.startswith('{')]
@@ -91,7 +96,7 @@ say "=== 4 ABBA perf"
 n=0; for arm in base tip tip base; do n=$((n+1)); BIN=$BASE; [ $arm = tip ] && BIN=$TIP; TAG=$arm-$n cell bench-$n $MEM bench; done
 
 # ---- 5 engagement: perf logger op counts on the tip (last ubatch)
-eng(){ GGML_VK_PERF_LOGGER=1 LD_LIBRARY_PATH=$TIP $TIP/llama-bench -m $MODEL -ngl 99 -fa 1 "${MFLAGS[@]}" -p 2048 -n 0 -b 2048 -ub 2048 -d 0 -r 1 9>&- > $OUT_DIR/engage.log 2>&1; fatal $OUT_DIR/engage.log
+eng(){ GGML_VK_PERF_LOGGER=1 LD_LIBRARY_PATH=$TIP${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} $TIP/llama-bench -m $MODEL -ngl 99 -fa 1 "${MFLAGS[@]}" -p 2048 -n 0 -b 2048 -ub 2048 -d 0 -r 1 9>&- > $OUT_DIR/engage.log 2>&1; fatal $OUT_DIR/engage.log
   python3 - $OUT_DIR/engage.log <<'PY' | tee -a $OUT
 import re,sys
 blocks=[];cur=None
