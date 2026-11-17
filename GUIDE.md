@@ -139,8 +139,9 @@ bars; `peek` shows a file's header. A mean hides a defect confined to one ubatch
 
 - `fa_masked_leak`: changes only K/V cells the mask hides; outputs must stay bit-identical. A visible-cell change per
   case must differ (exit 3 if it does not).
-- `topk_repeat`: the same `TOP_K` input many times in one process, with ties at the selection boundary; order and set
-  must repeat. A changed row must change its set (exit 3 if not).
+- `topk_repeat`: the same `TOP_K` input many times in one process, with ties at the selection boundary; the selected
+  set must repeat (`ggml_top_k` promises no order, so an order change is reported and fails only with
+  `TOPK_STRICT_ORDER=1`). A changed row must change its set (exit 3 if not).
 
 **First divergent node** (`evcb-diff.py`, upstream `llama-eval-callback` dumps of two builds): aligns nodes by name within
 a window (scheduler reorders and `node_N` renumbering are not differences) and prints the first shape / value
@@ -362,7 +363,7 @@ overhead once on your machine.
 
 | tool | what | trap it catches |
 |---|---|---|
-| `therm-sample.sh <out> [s]` + `therm-summary.py --load-aware` [AMD] | edge / Tctl / W / actual sclk / DPM level / busy %; hwmon resolved by *name* (numbers move across reboots) | throttled or cold cells. Clock tracks load continuously, so an absolute "sclk < max" rule flags every cell; use a load-aware rule (at >= 90% busy, max clock and power must reach a floor). Sample every 2 s. |
+| `therm-sample.sh <out> [s]` + `therm-summary.py` (load-aware by default) [AMD] | edge / Tctl / W / actual sclk / DPM level / busy %; hwmon resolved by *name* (numbers move across reboots) | throttled or cold cells. Clock tracks load continuously, so an absolute "sclk < max" rule flags every cell; use a load-aware rule (at >= 90% busy, max clock and power must reach a floor). Sample every 2 s. |
 | `clk-sample.py <out> <pid> [ms]` [AMD] | sclk, W, busy, fclk / mclk / socclk, voltages, host CPU %, bench process CPU % | memory-clock downshifts and host-feeder starvation that look like kernel regressions |
 | `dram-sample.py <out> <pid> [ms]` + `dram-summary.py` [AMD] | DRAM GB/s from `gpu_metrics` sysfs, no root | fields are u16 MB/s and **wrap at 65.5 GB/s**: unwrap by continuity, sample <= 100 ms, start before the GPU phase. Firmware EWMA (~1 s): deconvolve or use >= 3 s phases. Counts after the LLC, so cache hits are invisible. Calibrate against a known stream (`dram-mm`). |
 | `gcea-sample` + `chan-run.sh <out> -- cmd` [AMD] | per-memory-channel read / write requests via rocprofiler-sdk device counters, no root | channel camping (one channel takes all the traffic). Counts HIP/KFD work; check whether your driver exposes counters for Vulkan work before trusting a zero. |
