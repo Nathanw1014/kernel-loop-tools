@@ -103,14 +103,13 @@ else. This says what has been exercised, not how fast anything is.
   `repeat_gate.py --selftest` controls, `fa_masked_leak`, `topk_repeat`, `evcb-diff.py`, `moe-route.py cmp`, `vkq`
   (delay control reads SERIAL), `camp-hip` under the channel sampler (camped vs padded stride), `shader-diff.sh`.
 - **Ran, output checked against a reference:** `perflog.py` (row sums equal the logger's own totals), the DRAM, channel
-  and trace summarisers (same output as the tools they were derived from), `lds.py` (upstream's formula),
+  and trace summarisers (same numbers as the tools they were derived from), `lds.py` (upstream's formula),
   `job-summary.py`, the sharded `suite` (partition check, then a master-cache hit with no GPU), `rollback_gate.py` +
   `arms-compare.py` (two runs give identical streams), SQTT occupancy capture through decode (every debug marker matched
-  to its dispatch), `vktrace.py` on a build with the trace patch, `isa-histo.py` / `isa-stats.py` (zero attribution
-  errors).
+  to its dispatch), `isa-histo.py` / `isa-stats.py` (zero attribution errors).
 - **Ran, output read but no control or reference:** `mmid_det`, `dram-mm`, kv-membench, `peak.py`, `vkasm`,
   `isa-pipe`, `graphdump` + `camp.py`, `topkdump` + `moe-route.py stats`, `model-census.py`, `gguf-head.py`,
-  `sync-census.py`, `batch-validate.sh` (with `SUITE_ARGS`), `run-bench.sh`, `run-tbo.sh`, `run-quality.sh`,
+  `sync-census.py`, `vktrace.py` (on a build with the trace patch), `batch-validate.sh` (with `SUITE_ARGS`), `run-bench.sh`, `run-tbo.sh`, `run-quality.sh`,
   `run-batched.sh`, `repeat_gate.py --multiturn`, the samplers (therm, clk, flt, flt-io, fincore, pagecache, thrsample,
   memtrace, trace-run + analyze, cooldown, ttm-drain), `cpustress bw`.
 - **Gates that reported a difference on upstream master, cause not established:** `rollback_gate.py` (a discarded
