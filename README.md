@@ -14,21 +14,24 @@ each tool guards against, and a per-iteration checklist. This README is only the
 
 | dir | what | guide section |
 |---|---|---|
-| `lib/` | `klt-env.sh`: shared paths and defaults, sourced by every bash tool | all |
+| `lib/` | `klt-env.sh`: shared paths and defaults, sourced by every bash tool; `build-ggml-tools.sh` (builds the tools that link a llama.cpp build) | all |
 | `jobs/` | `job-run` (declarative job specs), `job-queue` (FIFO + fast / share lanes), `job-wait` (one blocking wait), `gpu-status`, `job-hazard` (fresh-input and repeat loops), `job-suite` (sharded test suite), `job-summary.py`, `stage-check` (idea linter) + `stage-check-dead.tsv`, `qos-run` / `qoshold.c` (optional CPU latency hold), `kernel-loop-queue.service` | 1, 10 |
-| `ab/` | `run-bench.sh` (run id + `.meta` / `.raw` / `.json`), `abba.sh` (counterbalanced ABBA, preset files), `abba-outliers.py`, `abba-postscan.py`, `gpu-state.sh`, `presets.example` | 7, 9 |
-| `correctness/` | `repeat_gate.py`, `rollback_gate.py`, `consist-gate.py`, `arms-compare.py`, `bisect-pred.sh`, `batch-validate.sh`, `percommit.sh`, `knobs.example` | 2, 3, 4 |
-| `samplers/` | `therm-sample.sh` / `therm-summary.py`, `clk-sample.py` / `clk-summary.py`, `flt-sample.sh`, `fincore.py`, `cooldown.sh`, `ttm-drain.sh`, `trace/` (tracefs wrapper + analyser) | 2, 7, 8 |
+| `ab/` | `run-bench.sh` (run id + `.meta` / `.raw` / `.json`), its siblings `run-quality.sh` (perplexity / KLD), `run-tbo.sh` (test-backend-ops), `run-batched.sh` (llama-batched-bench) on `run-lib.sh`, `abba.sh` (counterbalanced ABBA, preset files), `abba-outliers.py`, `abba-postscan.py`, `gpu-state.sh`, `presets.example` | 7, 9 |
+| `correctness/` | `repeat_gate.py` (`--multiturn`, `--selftest`), `rollback_gate.py` (`--p-tokens`, `--arms`), `consist-gate.py`, `arms-compare.py`, `bisect-pred.sh`, `batch-validate.sh`, `percommit.sh`, `knobs.example`, `kldtool.py` (KLD files and logs), `fa_masked_leak.cpp` / `topk_repeat.cpp` (backend probes with positive controls), `shader-diff.sh`, `prompts/` | 2, 3, 4 |
+| `samplers/` | `therm-sample.sh` / `therm-summary.py`, `clk-sample.py` / `clk-summary.py`, `flt-sample.sh`, `fincore.py`, `pagecache.py` (res / drop / warm), `cooldown.sh`, `ttm-drain.sh`, `trace/` (tracefs wrapper + analyser), `host/` (`thrsample.py`, `memtrace.sh`, `flt-io-sample.sh`, `cpustress.c` and `balloon.c` as contention controls) | 2, 7, 8 |
 | `mem/` | DRAM bandwidth (`dram-sample.py`, `dram-summary.py`, `dram-run.sh`), per-channel counters (`gcea-sample.cpp`, `chan-*.sh`, `chan-summary.py`, `gcea-channels.py`), `camp-hip.cpp` (channel-camping positive control), `vk-pc-list.c`, `DRAM-MONITOR.md` | 8 |
-| `bench/` | `mmid_det.cpp` (whole-graph op bench), `dram-mm.cpp` (steady-state matmul), `kv-membench/` (stride / occupancy / latency, plain Vulkan), `lds.py`, `hip-loop-histo.py` | 5 |
-| `graph/` | `fusion-census.py`, `fusion-misses.py`, `sync-census.py`, `split-bisect.py`, `fusion-family-bisect.sh`, `model-census.py` | 3, 4, 5 |
+| `bench/` | `mmid_det.cpp` (whole-graph op bench), `dram-mm.cpp` (steady-state matmul), `kv-membench/` (stride / occupancy / latency, plain Vulkan), `lds.py`, `hip-loop-histo.py`, `vk/` (plain-Vulkan kit: `vkrun`, `peak.py` + `wmma_peak*.comp`, `vkgemm`, `vkasm`, `isa-pipe`, `isa-histo.py`, `isa-stats.py`, `vkq` + `spin.comp`, `build.sh`) | 5 |
+| `graph/` | `fusion-census.py`, `fusion-misses.py`, `sync-census.py`, `split-bisect.py`, `fusion-family-bisect.sh`, `model-census.py`, `graphdump.cpp` + `camp.py` (static stride / camping census), `evcb-diff.py` (first divergent node), `topkdump.cpp` + `moe-route.py` (MoE routing census), `gguf-head.py` | 3, 4, 5 |
 | `perflog/` | `perflog.py` (perf-logger parser: `blocks`, `top`, `sum`, `diff`, `shapes`, `ubatch`, `xbackend`), `vktrace.py`, `tracecmp.py`, `tests/` | 6 |
 | `sqtt/` | wave / instruction-level traces from RGP captures; see `sqtt/README.md` | 8 |
 
 ## Setup
 
 Nothing to install for the Python and bash tools (Python 3 stdlib, bash, flock, coreutils).
-C/C++ tools build from the line in each file's header or its `build-*.sh`.
+C/C++ tools build from the line in each file's header or its `build-*.sh`: `bench/vk/build.sh` for the plain-Vulkan kit
+(Vulkan headers + glslc), `lib/build-ggml-tools.sh <llama.cpp source> <build dir>` for the tools that link libllama /
+libggml (`graphdump`, `topkdump`, `fa_masked_leak`, `topk_repeat`). Link those against the build you are testing.
+Python tools need only the stdlib, except `kldtool.py peek|diff` (numpy).
 
 All state goes through `lib/klt-env.sh`; override any of these in your environment:
 

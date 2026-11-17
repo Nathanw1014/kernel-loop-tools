@@ -1,0 +1,35 @@
+#version 450
+// wmma_peak.comp: cooperative-matrix (KHR_cooperative_matrix) f16 x f16 -> f32 16x16x16 peak. Every subgroup runs NACC
+// independent accumulator chains of ITER x 8 coopMatMulAdd on register operands (no memory traffic in the loop), plus
+// NVALU independent f32 FMAs per 8 MMAs to see whether vector ALU work co-issues with the matrix unit.
+// Run with vkrun / peak.py; spec constants: ITER, NVALU, NACC. Buffer: vkrun's 64 MiB float buffer.
+// build: glslc -O --target-env=vulkan1.3 wmma_peak.comp -o wmma_peak.spv
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer O { float o[]; };
+layout(constant_id = 0) const uint ITER = 1024;
+layout(constant_id = 1) const uint NVALU = 0;     // independent f32 fma per 8 WMMAs
+layout(constant_id = 2) const uint NACC = 8;      // independent accumulators (chains)
+void main() {
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(float16_t(o[gl_LocalInvocationID.x] ));
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(float16_t(o[gl_LocalInvocationID.x + 1]));
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
+    [[unroll]] for (uint j = 0; j < 8; j++) acc[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    float v[16];
+    [[unroll]] for (uint k = 0; k < 16; k++) v[k] = o[gl_LocalInvocationID.x + 2 + k];
+    const float c = o[300], d = o[301];
+    for (uint i = 0; i < ITER; i++) {
+        [[unroll]] for (uint j = 0; j < 8; j++) {
+            if (j < NACC) acc[j] = coopMatMulAdd(A, B, acc[j]); else acc[0] = coopMatMulAdd(A, B, acc[0]);
+        }
+        [[unroll]] for (uint k = 0; k < NVALU; k++) v[k % 16] = fma(v[k % 16], c, d);
+    }
+    float s = 0.0;
+    [[unroll]] for (uint j = 0; j < 8; j++) s += acc[j][0];
+    [[unroll]] for (uint k = 0; k < 16; k++) s += v[k];
+    o[gl_GlobalInvocationID.x + 512] = s;
+}

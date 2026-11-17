@@ -114,10 +114,12 @@ before running, so an unexpected value cannot be rationalised afterwards.
 - *Repeat gate* (`repeat_gate.py`): identical greedy requests to `llama-server`, compare token streams; with
   `n_probs`, compare per-position logprob streams exactly (`QUIET` / `DETECT`). Catches
   ULP-scale non-repeatability before it flips a token. Run it against a known-broken build
-  once to see it `DETECT`.
+  once to see it `DETECT`. `--multiturn` runs a conversation (appends plus one edit-and-regenerate turn) through the
+  prompt cache and compares every cached turn with a full re-prefill of the same messages; it fails if an append turn
+  did not hit the cache (the path under test never ran). `--selftest` runs its classifier controls without a server.
 - *Rollback gate* (`rollback_gate.py`): prompt-cache rollback must be bit-exact. Arms differ only in a discarded
   branch, each on a fresh server launch, with a null arm (same arm twice) and a positive
-  control (one prompt token changed).
+  control (one prompt token changed). `--p-tokens N` moves the rollback point deep into the context.
 - *Multi-slot consistency* (`consist-gate.py`): each prompt served alone twice, then all at once on distinct
   slots, twice. Any mismatch is reported with the top-5 logprobs at the first differing
   position; a near tie reads as batch-shape numerics, a wide gap as a wrong-result candidate.
@@ -127,6 +129,25 @@ before running, so an unexpected value cannot be rationalised afterwards.
 two binaries. Judge a quant or speed change by its KLD *delta* over a base cell on the same
 binary, and know your floor: any change to f32 rounding order in a recurrent state costs a
 measurable KLD on its own.
+
+**Where two runs differ, not only how much** (`kldtool.py`): `diff` compares two `--kl-divergence-base` files row by
+row and reports the positions, the position within `-ub` and the ubatch of every differing row (a band at ubatch tails,
+one ubatch shape, one chunk); `log` parses the padded KLD block of a log and compares two runs against their error
+bars; `peek` shows a file's header. A mean hides a defect confined to one ubatch shape.
+
+**Backend probes with built-in positive controls** (no model, any ggml backend by name; run `CPU` as the reference):
+
+- `fa_masked_leak`: changes only K/V cells the mask hides; outputs must stay bit-identical. A visible-cell change per
+  case must differ (exit 3 if it does not).
+- `topk_repeat`: the same `TOP_K` input many times in one process, with ties at the selection boundary; order and set
+  must repeat. A changed row must change its set (exit 3 if not).
+
+**First divergent node** (`evcb-diff.py`, upstream `llama-eval-callback` dumps of two builds): aligns nodes by name within
+a window (scheduler reorders and `node_N` renumbering are not differences) and prints the first shape / value
+differences. `--selftest` checks the alignment. Resolution is the printed 6-decimal sum.
+
+**Shader identity** (`shader-diff.sh <build-A> <build-B>`): a host-only change must leave every generated SPIR-V and embed
+identical; a shader change must touch only the files you meant. Same glslc on both sides, or everything differs.
 
 **Zero-output ubatches.** `llama-bench` outputs the last token of every decode, so it never
 builds a ubatch with zero outputs. `llama-perplexity` with a long context, and `llama-server`
@@ -173,6 +194,9 @@ cannot see non-engagement.
   prompt; count the gate decision.
 - **Some paths need depth to exist.** A sparse-attention or top-k selection path with a key
   budget cannot engage below that many keys. Run its engagement cells deeper than the budget.
+- **MoE routing census** (`topkdump` + `moe-route.py`, upstream tensor `ffn_moe_topk`): rows per active expert per ubatch
+  and tile fill (is the MUL_MAT_ID tile you tuned ever full at this `-ub`?), expert-set agreement between two builds of
+  the same prompt and split, and expert sharing within small batches against random routing.
 - **Sync census** (`sync-census.py`, reads upstream `GGML_VK_SYNC_LOGGER` output): count
   syncs per graph eval and histogram the op right after each sync. Unexpected syncs are
   where overlap is lost.
@@ -225,6 +249,18 @@ ratios can reverse sign in the model.
   compute LDS bytes for a matmul warptile and fail over the limit; read register / LDS use
   from the compiled shader (`hip-loop-histo.py` for a HIP `.s` inner loop). Free, no GPU,
   do it first.
+- *Plain-Vulkan kit* (`bench/vk/`, no ggml): `vkrun` dispatches any SPIR-V with spec constants; `peak.py` measures the
+  cooperative-matrix peak from a slope over two sizes (submit cost cancels), so "% of peak" has a measured denominator;
+  `vkgemm` times one `mul_mm` shader variant outside ggml, with a cold-output mode; `vkasm` and `isa-pipe` build one
+  pipeline so the driver dumps its ISA (`isa-pipe` also for GPU families you do not have, via RADV's null device);
+  `isa-histo.py` counts the main loop's instruction mix; `isa-stats.py` does it for every pipeline a real run compiles
+  (upstream `GGML_VK_PIPELINE_STATS`); `vkq` measures whether two queues really overlap (control: a delay longer than one
+  job must read SERIAL).
+- *Static camping check* (`graphdump` + `camp.py`): every tensor a GEMM / FA / scan node reads, with its row stride and
+  `gcd(stride / granule, channels)`. Set granule and channel count to your memory interleave. Cheap, needs only the
+  public eval callback; confirm a suspect stride at runtime with the channel sampler (section 8).
+- *Header-only model facts* (`gguf-head.py <file-or-url>`): types, bytes per tensor pattern and hparams without downloading
+  weights; the weight bytes per token for a roofline.
 - *Shape census* (`model-census.py <gguf>`): every dense matmul `(M, K, type)` with its
   multiplicity, so op benches cover the shapes that carry the time.
 - *First-principles cost model*: per-ubatch FLOPs and bytes per op from the model dims; the
@@ -333,6 +369,11 @@ overhead once on your machine.
 | `camp-hip <stride_B> <chunk_B> [secs] [buf_MiB]` [AMD] | reads `chunk` bytes at the start of every row of a `stride` pitch | positive control for the channel sampler: a stride at a multiple of the interleave period with a small chunk must camp; a padded stride must spread |
 | `vk-pc-list` | lists `VK_KHR_performance_query` counters for the device | tells you which hardware counters the driver exposes before you plan on one |
 | `fincore.py <file>` | page-cache residency per file via `mincore` | an arm that "got faster" because the model became resident |
+| `pagecache.py res\|drop\|warm <file>...` | residency, plus per-file drop (`fadvise DONTNEED`) and warm, no root | putting both arms into the same cache state instead of hoping; drop leaves pages a running process maps |
+| `host/thrsample.py <pid> <out>` | per-thread CPU time of a process tree beside GPU busy % | a host thread (graph build, sampling, busy-wait submit) that the GPU waits for |
+| `host/memtrace.sh <prefix> cmd` | MemAvailable / Cached / Anon, process RSS split, GTT, largest mappings, every second | where a load's memory goes (page cache vs anon copy vs GTT) and the peak that kills |
+| `host/flt-io-sample.sh <ppid> <out>` | major / minor faults plus block-layer and requested read bytes of the child | a model re-read from storage per run, or a cold arm passing as warm |
+| `host/cpustress <mode> <n>`, `host/balloon <GiB> <ready>` | pinned CPU load (FMA / L2 / DRAM stream / spin); held, touched, locked memory | positive controls for host contention and memory pressure on shared-memory machines: show the job slows when it should before claiming it does not |
 | `trace-run [--set S] -- cmd` + `analyze.py` | private tracefs instance around one command: GPU scheduler run/done, amdgpu CS / BO moves / VM flushes, fence waits, reclaim; sets add sched wakeups, ioctls, block I/O and preads of the bench threads. Needs `sudo -n`. | host-side causes: CPU wake latency on decode, storage reads per token. Keep sets narrow; a wide set can overrun its buffer and change what it measures. |
 
 A cell that reads a few percent low with a tight within-run spread is a confound until proven
@@ -359,6 +400,10 @@ files per run plus one `INDEX.tsv` row:
 - `<id>.json`: `llama-bench -o json` (its stdout), the graphing source.
 
 Nothing in it interprets. Derived tables are separate files that cite run ids.
+
+Siblings with the same discipline (lock, STOP refusal, `.meta` / `.raw`): `run-quality.sh` (llama-perplexity, PPL / KLD
+row in `QUALITY.tsv`), `run-tbo.sh` (test-backend-ops, args untouched because its `-o` is the op filter; a test run that
+selects nothing exits 3), `run-batched.sh` (llama-batched-bench, `--output-format jsonl`).
 
 **The tell that you have stopped keeping records:** a command line containing both
 `llama-bench` and a pipe into `grep` / `sed` / `awk`. One inline sanity probe is fine. The
